@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Needle in a Haystack</title>
+<meta name="description" content="A competitive 3D multiplayer scavenger hunt. Dig through a gigantic hay field and find the needle before your friends do.">
+<meta name="theme-color" content="#1b1209">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%231b1209'/%3E%3Cpath d='M8 50 C6 38 16 26 30 28 C40 20 56 28 56 50Z' fill='%23e0b04f'/%3E%3Cpath d='M18 44 L52 22' stroke='%23fff' stroke-width='3' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/css/style.css">
+</head>
+<body data-screen="loading">
+<canvas id="game" tabindex="-1"></canvas>
+<div id="ui"></div>
+<div id="loading"><div class="spin"></div><div id="loadTxt">Loading NEEDLE IN A HAYSTACK…</div><div id="loadErr"></div></div>
+<noscript><div class="panel" style="position:fixed;inset:20% 10%;padding:24px">This game needs JavaScript.</div></noscript>
+<script type="module">
+// Load Three.js: first from this server (installed at deploy time), then from public CDNs. Then start the game.
+const SOURCES = ['/vendor/three.module.js',
+  'https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js',
+  'https://unpkg.com/three@0.160.0/build/three.module.js',
+  'https://cdnjs.cloudflare.com/ajax/libs/three.js/0.160.0/three.module.min.js'];
+const err = document.getElementById('loadErr'), txt = document.getElementById('loadTxt');
+let THREE = null;
+for (const src of SOURCES) {
+  try { THREE = await import(src); break; } catch (e) { console.warn('three source failed:', src, e); }
+}
+if (!THREE) {
+  txt.textContent = 'Could not load the 3D engine.';
+  err.textContent = 'Check your internet connection and reload the page. If this keeps happening, a network filter may be blocking the game\'s scripts.';
+} else {
+  globalThis.__THREE = THREE;
+  try { await import('/js/main.js'); }
+  catch (e) { console.error(e); txt.textContent = 'The game failed to start.'; err.textContent = String(e && e.message || e); }
+}
+</script>
+</body>
+</html>
