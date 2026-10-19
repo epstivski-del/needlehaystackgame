@@ -1,7 +1,8 @@
-// NEEDLE IN A HAYSTACK — game client: UI, networking, first-person controller, HUD.
+// FLOCK RUSH — game client: UI, networking, third-person dog controller, HUD, minimap.
 // Online play talks to the authoritative server over WSS. Practice mode runs the SAME engine locally (no network).
-import * as W from '/shared/world.js';
-import { Hub, MODES, COSMETICS, DECOYS, unlocked } from '/shared/engine.js';
+import { generateField, resolveCollision, mudAt, forward, DOG_RADIUS } from '/shared/field.js';
+import { TUNING, SHEEP_TYPES } from '/shared/sim.js';
+import { Hub, MODES, COSMETICS, FLOCKS } from '/shared/engine.js';
 import { createView } from '/js/view.js';
 import { audio } from '/js/audio.js';
 
@@ -16,12 +17,15 @@ function h(tag, props, ...kids) {
   return e;
 }
 const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+const TAU = Math.PI * 2;
 const fmtTime = ms => { const s = Math.max(0, Math.ceil(ms / 1000)); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; };
-const store = { get(k, d) { try { const v = localStorage.getItem('needle.' + k); return v == null ? d : JSON.parse(v); } catch { return d; } }, set(k, v) { try { localStorage.setItem('needle.' + k, JSON.stringify(v)); } catch {} } };
-const sess = { get() { try { return JSON.parse(sessionStorage.getItem('needle.session') || 'null'); } catch { return null; } }, set(v) { try { sessionStorage.setItem('needle.session', JSON.stringify(v)); } catch {} }, clear() { try { sessionStorage.removeItem('needle.session'); } catch {} } };
+const store = { get(k, d) { try { const v = localStorage.getItem('flock.' + k); return v == null ? d : JSON.parse(v); } catch { return d; } }, set(k, v) { try { localStorage.setItem('flock.' + k, JSON.stringify(v)); } catch {} } };
+const sess = { get() { try { return JSON.parse(sessionStorage.getItem('flock.session') || 'null'); } catch { return null; } }, set(v) { try { sessionStorage.setItem('flock.session', JSON.stringify(v)); } catch {} }, clear() { try { sessionStorage.removeItem('flock.session'); } catch {} } };
+const TEAM_COLOR = ['#e4472f', '#3a78d8'], TEAM_NAME = ['Red team', 'Blue team'];
+const angLerp = (a, b, t) => { const d = ((b - a + Math.PI) % TAU + TAU) % TAU - Math.PI; return a + d * t; };
 
 // ------------------------------------------------------------------ settings
-const DEFAULTS = { sens: 1, master: 0.8, music: 0.5, sfx: 0.9, bob: true, reduceMotion: false, reduceFlash: false, uiScale: 1, quality: 'medium', musicInGame: true, name: '', cosm: {} };
+const DEFAULTS = { sens: 1, master: 0.8, music: 0.5, sfx: 0.9, reduceMotion: false, reduceFlash: false, uiScale: 1, quality: 'medium', musicInGame: true, name: '' };
 const settings = { ...DEFAULTS, ...store.get('settings', {}) };
 const saveSettings = () => store.set('settings', settings);
 function applySettings() {
@@ -35,15 +39,14 @@ function applySettings() {
 
 // ------------------------------------------------------------------ state
 const S = {
-  net: null, practice: false, you: null, code: null, token: null, room: null, round: null, world: null, phase: 'menu', inGame: false,
-  remaining: 0, phaseMs: 0, lastTimerAt: 0, scores: new Map(), teams: {}, hider: null, results: null,
-  search: null, revealed: new Map(), det: { on: false, level: 0, battery: 100, nextBeep: 0, avail: false }, lastLevel: 0, flash: 0,
-  notes: [], chat: [], connected: false, reconnecting: false, tabDown: false,
+  net: null, practice: false, you: null, code: null, token: null, room: null, round: null, field: null, phase: 'menu', inGame: false, screen: 'menu',
+  remaining: 0, phaseMs: 0, lastTimerAt: 0, slots: {}, teams: {}, results: null, spectator: false, spectateId: null,
+  scores: { pens: [], players: new Map(), total: 1, dom: null }, sheep: [], chat: [], connected: false, reconnecting: false, tabDown: false, lastCd: 0, thunderAt: 0, warnAt: 0,
 };
-let view = null, canvas = null, rafId = 0, lastFrame = 0, ui = null, hud = null;
-const L = { x: 0, y: 0, z: 0, vx: 0, vz: 0, vy: 0, yaw: 0, pitch: 0, onGround: true, stamina: 100, staminaHold: 0, bob: 0, bobT: 0, stepD: 0, fov: 75, roll: 0, eye: W.EYE_HEIGHT, sprinting: false, moving: false, wasAir: false };
+let view = null, canvas = null, rafId = 0, lastFrame = 0, ui = null, hud = null, mini = null, miniCtx = null;
+const L = { x: 0, z: 0, vx: 0, vz: 0, camYaw: 0, camPitch: 0.52, dogYaw: 0, stamina: 100, staminaHold: 0, barkReady: 0, dashReady: 0, howlReady: 0, barkAnim: 0, howlAnim: 0, dashUntil: 0, dashDir: [0, 0], stunUntil: 0, moving: false, sprinting: false, inMud: false, shake: 0, stepD: 0 };
 const keys = new Set();
-let lockWanted = false, sendT = 0, lastClick = 0, lastDigSound = 0;
+let lockWanted = false, sendT = 0, miniT = 0, baaT = 0;
 const remotes = new Map();
 
 // ------------------------------------------------------------------ networking
@@ -68,7 +71,7 @@ class OnlineNet {
   close() { this.closedByUs = true; this.stopPing(); try { this.ws?.close(); } catch {} }
   lost() {
     if (!S.code || !S.token) { toast('Disconnected from the server.', 'bad'); return goMenu(); }
-    S.reconnecting = true; note('Connection lost. Reconnecting…', 'bad'); showBanner('Connection lost — reconnecting…');
+    S.reconnecting = true; toast('Connection lost. Reconnecting…', 'bad'); showBanner('Connection lost — reconnecting…');
     const attempt = async () => {
       if (this.closedByUs) return;
       this.retry++; if (this.retry > 14) { hideBanner(); toast('Could not reconnect to the room.', 'bad'); S.reconnecting = false; return goMenu(); }
@@ -92,10 +95,7 @@ class LocalNet { // Practice mode: the very same engine, running in this tab, wi
 function setConn(ok) { const el = $('#conn'); if (!el) return; el.className = ok ? 'ok' : 'bad'; el.title = ok ? 'Connected' : 'Disconnected'; if (ok) hideBanner(); }
 function showBanner(t) { let b = $('#banner'); if (!b) { b = h('div', { id: 'banner' }); document.body.append(b); } b.textContent = t; b.style.display = 'block'; }
 function hideBanner() { const b = $('#banner'); if (b) b.style.display = 'none'; }
-
-// ------------------------------------------------------------------ toasts / notifications
-function toast(text, kind = '') { const box = $('#toasts'); const t = h('div', { class: 'toast ' + kind }, text); box.append(t); setTimeout(() => t.classList.add('out'), 3200); setTimeout(() => t.remove(), 3700); while (box.children.length > 5) box.firstChild.remove(); }
-function note(text, kind = '') { toast(text, kind); }
+function toast(text, kind = '') { const box = $('#toasts'); if (!box) return; const t = h('div', { class: 'toast ' + kind }, text); box.append(t); setTimeout(() => t.classList.add('out'), 3200); setTimeout(() => t.remove(), 3700); while (box.children.length > 5) box.firstChild.remove(); }
 
 // ------------------------------------------------------------------ message handling
 function onMessage(m) {
@@ -108,181 +108,170 @@ function onMessage(m) {
       if (S.screen !== 'game' && S.screen !== 'lobby' && !m.practice) showLobby();
       return;
     }
-    case 'room': S.room = m; for (const p of m.players) S.scores.set(p.id, { round: p.roundScore, total: p.score, needles: p.needles }); if (!m.practice && S.phase !== 'playing' && S.phase !== 'countdown' && S.phase !== 'setup' && S.phase !== 'results') { S.phase = m.phase; } return onRoom();
-    case 'notice': if (m.kind === 'join') audio.join(); else if (m.kind === 'leave') audio.leave(); if (!S.practice || m.kind === 'info') note(m.text, m.kind === 'leave' ? 'bad' : ''); if (m.kind === 'leave' && m.who) { remotes.delete(m.who); view?.removeRemote(m.who); } return;
+    case 'room': S.room = m; if (!m.practice && !['playing', 'countdown', 'results'].includes(S.phase)) S.phase = m.phase; return onRoom();
+    case 'notice': if (m.kind === 'join') audio.join(); else if (m.kind === 'leave') audio.leave(); if (!S.practice || m.kind === 'info') toast(m.text, m.kind === 'leave' ? 'bad' : ''); return;
     case 'chat': S.chat.push(m); if (S.chat.length > 60) S.chat.shift(); return renderChat();
     case 'err': unbusy(); audio.error(); toast(m.msg, 'bad'); if (['NOT_FOUND', 'BAD_CODE', 'FULL', 'LOCKED', 'BANNED', 'NAME_BAD', 'RATE_LIMIT', 'SERVER_BUSY'].includes(m.code) && !S.room) { sess.clear(); S.net?.close(); S.net = null; goMenu(); } if (m.code === 'NOT_FOUND') sess.clear(); if (m.code === 'REPLACED') { S.net?.close(); S.net = null; goMenu(); } return;
     case 'kicked': toast(m.msg, 'bad'); sess.clear(); S.code = null; S.token = null; S.net?.close(); S.net = null; return goMenu();
     case 'round': return startRound(m);
-    case 'phase': S.phase = m.phase; S.remaining = m.remainingMs; S.phaseMs = m.phaseMs || 0; S.lastTimerAt = performance.now(); if (m.phase === 'playing') { audio.go(); banner('GO!', 'Find the needle'); L.stamina = 100; } if (m.phase === 'setup') banner(S.hider === S.you ? 'Hide the needle' : 'The hider is hiding the needle…', S.hider === S.you ? 'Stand in a hay pile and press E' : 'Hold tight'); return updateObjective();
+    case 'phase': S.phase = m.phase; S.remaining = m.remainingMs; S.phaseMs = m.phaseMs || 0; S.lastTimerAt = performance.now(); if (m.phase === 'playing') { audio.go(); banner('GO!', S.round?.mode === 'team' ? 'Fill your team\'s pen' : 'Herd the flock into YOUR pen'); L.stamina = 100; } return updateObjective();
     case 'timer': S.phase = m.phase; S.remaining = m.remainingMs; S.lastTimerAt = performance.now(); if (m.phase === 'playing' && m.remainingMs <= 10000 && m.remainingMs > 0) audio.tick(m.remainingMs <= 3000); return;
     case 'snap': return onSnap(m);
-    case 'tp': { L.x = m.x; L.z = m.z; if (m.y != null) L.y = m.y; if (m.yaw != null) L.yaw = m.yaw; if (m.hard) { L.vx = L.vz = L.vy = 0; } return; }
+    case 'sheep': S.sheep = m.s; view?.setSheep(m.s); return;
+    case 'tp': { L.x = m.x; L.z = m.z; if (m.yaw != null) L.dogYaw = m.yaw; if (m.hard) { L.vx = L.vz = 0; } return; }
+    case 'fx': if (m.k === 'stun') { L.stunUntil = performance.now() + m.ms; L.vx = L.vz = 0; L.shake = 0.5; audio.bump(); flash('#ffe27a'); } return;
     case 'ev': return onEvent(m);
-    case 'scores': for (const [id, r, t, n] of m.s) S.scores.set(id, { round: r, total: t, needles: n }); return updateScoreboard();
-    case 'search_started': S.search = { start: performance.now(), ms: m.ms, sent: false }; audio.searchStart(); view?.setDigging(true); toast('Searching…'); return;
-    case 'search_denied': S.search = null; view?.setDigging(false); if (m.why === 'nopile') toast('Nothing to dig through here. Walk into hay first.', 'bad'); return;
-    case 'search_result': return onSearchResult(m);
-    case 'reveal': S.revealed.set(m.id, { x: m.x, z: m.z, golden: m.golden }); view?.showNeedle(m.id, m.x, m.z, m.golden); audio.needleReveal(); toast(m.golden ? 'The GOLDEN needle! Press E to grab it!' : 'You uncovered the needle! Press E to grab it!', 'good'); return;
-    case 'pickup_fail': if (m.why === 'late') toast('Too late. Someone got there first.', 'bad'); else if (m.why === 'range') toast('Get closer to the needle.', 'bad'); return;
-    case 'det': S.det.level = m.s; S.det.battery = m.b; S.det.on = m.on; if (m.low) { toast('Detector battery low.', 'bad'); audio.detLow(); } view?.setDetector(S.det.on, S.det.level); return updateDetHud();
-    case 'placed': if (m.ok) { toast('Needle hidden! Waiting for the hunt to begin…', 'good'); audio.needleReveal(); } else toast(m.msg, 'bad'); return;
+    case 'scores': S.scores = { pens: m.pens, players: new Map(m.players.map(r => [r[0], { score: r[1], herded: r[2], steals: r[3] }])), total: Math.max(1, m.total), dom: m.dom }; return updateScoreboard();
     case 'lobby': S.phase = 'lobby'; return showLobby();
     case 'results': return onResults(m);
   }
 }
 
 function onRoom() {
+  updatePenOwners();
   if (S.screen === 'lobby') renderLobby();
   if (S.inGame) { updateScoreboard(); updateHudStatic(); }
-  const me = S.room?.players.find(p => p.id === S.you);
-  if (me && S.screen === 'results') renderResultsButtons();
+  if (S.screen === 'results') renderResultsButtons();
 }
+
+const myInfo = () => S.room?.players.find(p => p.id === S.you);
+const infoOf = id => S.room?.players.find(p => p.id === id);
+const teamMode = () => S.round?.mode === 'team';
+function colorOf(id) { const p = infoOf(id); if (teamMode()) { const t = S.teams[id] ?? p?.team; if (t != null) return TEAM_COLOR[t]; } return p?.cosm?.color || '#ffffff'; }
+function slotColor(slot) { if (teamMode()) return TEAM_COLOR[slot] || '#fff'; const id = Object.keys(S.slots).find(k => S.slots[k] === slot); return id ? colorOf(+id) : '#cfcfcf'; }
+function slotName(slot) { if (teamMode()) return TEAM_NAME[slot]; const id = Object.keys(S.slots).find(k => S.slots[k] === slot); return id ? (infoOf(+id)?.name || 'Dog') : 'Empty pen'; }
+function updatePenOwners() { if (!view || !S.field) return; for (const p of S.field.pens) view.setPenOwner(p.slot, slotName(p.slot) + (p.slot === S.round?.you?.slot ? '  (you)' : ''), slotColor(p.slot)); }
 
 // ------------------------------------------------------------------ round start
 function startRound(m) {
-  S.round = m; S.phase = m.phase; S.hider = m.hiderId; S.teams = m.teams || {}; S.remaining = m.remainingMs; S.phaseMs = m.phaseMs; S.lastTimerAt = performance.now();
-  S.revealed.clear(); S.search = null; S.results = null; S.det = { on: false, level: 0, battery: m.battery ?? 100, nextBeep: 0, avail: !!m.detector };
-  S.world = W.generateWorld(m.seed, m.map);
+  S.round = m; S.phase = m.phase; S.teams = m.teams || {}; S.slots = m.slots || {}; S.remaining = m.remainingMs; S.phaseMs = m.phaseMs; S.lastTimerAt = performance.now(); S.results = null;
+  S.spectator = !!m.you.spectator; S.spectateId = null; S.scores = { pens: [], players: new Map(), total: 1, dom: null }; S.sheep = [];
+  S.field = generateField(m.seed, m.field);
   if (!view) initView();
-  view.setQuality(settings.quality); view.loadWorld(S.world); view.clearRemotes(); remotes.clear();
-  view.setDetector(false, 0); view.setDigging(false); view.setLoadout({ skin: myCosm().skin, gloves: myCosm().gloves });
-  const sp = m.you.spawn || S.world.spawns[0]; Object.assign(L, { x: sp.x, y: 0, z: sp.z, vx: 0, vz: 0, vy: 0, yaw: sp.yaw ?? 0, pitch: 0, onGround: true, stamina: 100, staminaHold: 0, bob: 0, stepD: 0 });
+  view.setQuality(settings.quality); view.loadField(S.field); view.clearDogs(); remotes.clear(); view.setStorm(!!m.storms); view.snapCamera();
+  updatePenOwners();
+  const sp = m.you.spawn || { x: 0, z: 0, yaw: 0 };
+  Object.assign(L, { x: sp.x, z: sp.z, vx: 0, vz: 0, dogYaw: sp.yaw ?? 0, camYaw: sp.yaw ?? 0, camPitch: 0.52, stamina: 100, staminaHold: 0, barkReady: 0, dashReady: 0, howlReady: 0, dashUntil: 0, stunUntil: 0, shake: 0, barkAnim: 0, howlAnim: 0 });
   enterGame();
-  banner('Get ready', MODES[m.mode]?.label || '');
+  banner(m.practice ? 'Practice' : (MODES[m.mode]?.label || ''), S.spectator ? 'Spectating until the next round' : 'Get ready');
 }
-
-function myCosm() { return S.room?.players.find(p => p.id === S.you)?.cosm || {}; }
 
 function onResults(m) {
-  S.results = m; S.phase = 'results'; S.search = null; view?.setDigging(false); view?.setDetector(false, 0); S.det.on = false;
-  for (const n of m.needles) view?.showNeedle('end' + n.x, n.x, n.z, n.golden);
-  const mine = m.winners.includes(S.you), solo = S.practice;
-  if (m.reason === 'found' || mine) { mine ? audio.victory() : audio.roundEndOther(); } else audio.defeat();
-  releaseLock(); setTimeout(() => { if (S.phase === 'results') showResults(); }, S.practice ? 400 : 1600);
+  S.results = m; S.phase = 'results'; L.vx = L.vz = 0;
+  const mine = m.winners.includes(S.you);
+  if (mine) audio.victory(); else if (m.winners.length) audio.roundEndOther(); else audio.defeat();
+  releaseLock(); setTimeout(() => { if (S.phase === 'results') showResults(); }, S.practice ? 500 : 1700);
 }
 
+// ------------------------------------------------------------------ events
+const relTo = id => { const r = remotes.get(id); const d = r?.last; return d ? { id, dx: d.x - L.x, dz: d.z - L.z, yaw: L.camYaw } : null; };
 function onEvent(m) {
   switch (m.k) {
-    case 'needle_found': {
-      const me = m.id === S.you; S.revealed.delete(m.needleId); view?.hideNeedle(m.needleId);
-      toast(me ? `You found the ${m.golden ? 'golden ' : ''}needle! +${m.points}` : `${m.name} found the ${m.golden ? 'golden ' : ''}needle!`, me ? 'good' : 'bad');
-      if (me) { audio.needlePickup(m.golden); flash('#ffd24a'); } else audio.notify();
-      banner(me ? 'YOU FOUND IT!' : `${m.name} found the needle`, '');
+    case 'penned': case 'stolen': {
+      const mine = m.by === S.you, stolen = m.k === 'stolen', name = SHEEP_TYPES[m.type]?.name?.toLowerCase() || 'sheep', who = infoOf(m.by)?.name || 'Someone';
+      const myPen = m.slot === S.round?.you?.slot;
+      view?.pennedFx(m.slot, m.type === 'g'); if (stolen) view?.stolenFx(m.from);
+      if (mine) { audio.penned(m.value); toast(`${stolen ? 'Stolen! ' : ''}+${m.value} ${m.type === 'g' ? '★ golden sheep' : name}`, 'good'); if (m.type === 'g') flash('#ffd34a'); }
+      else if (myPen && !stolen) { audio.penned(m.value); toast(`${m.by >= 0 ? who : 'The flock'} penned a ${name} for you`, 'good'); }
+      else if (stolen && myPen) { audio.stolen(true); toast(`${who} stole a ${name}!`, 'good'); }
+      else if (stolen && m.from === S.round?.you?.slot) { audio.stolen(false); toast(`${who} stole a ${name} from your pen!`, 'bad'); }
+      else if (!S.practice && m.by >= 0) toast(`${who} ${stolen ? 'stole' : 'penned'} a ${name}`);
       return;
     }
-    case 'needle_moved': S.revealed.clear(); view?.hideNeedles(); toast('A new needle has been hidden!', ''); return;
-    case 'decoy': toast(`${m.name} dug up a ${m.type}${m.points ? ` (+${m.points})` : ''}`); return;
-    case 'search_start': return; // remote avatars animate from snapshot flags
-    case 'search_stop': return;
-    case 'gone': remotes.delete(m.id); view?.removeRemote(m.id); return;
+    case 'bark': { if (m.id === S.you) return; const r = remotes.get(m.id)?.last; if (r) view?.bark(r.x, r.z, r.yaw); audio.bark(relTo(m.id)); return; }
+    case 'howl': { if (m.id === S.you) return; const r = remotes.get(m.id)?.last; if (r) view?.howl(r.x, r.z); audio.howl(relTo(m.id)); return; }
+    case 'dash': { if (m.id === S.you) return; const r = remotes.get(m.id)?.last; if (r) view?.dashFx(r.x, r.z); audio.dash(relTo(m.id)); return; }
+    case 'bump': { const v = m.victim === S.you ? { x: L.x, z: L.z } : remotes.get(m.victim)?.last; if (v) view?.bumpFx(v.x, v.z); audio.bump(m.victim === S.you ? null : relTo(m.victim)); if (m.id === S.you) { toast('Bump! Rival stunned', 'good'); } return; }
+    case 'thunder_warn': S.warnAt = performance.now(); audio.thunderWarn(); banner('⚡ Storm incoming', 'The flock is about to bolt'); return;
+    case 'thunder': S.thunderAt = performance.now(); view?.lightning(); audio.thunder(); flash('#ffffff'); L.shake = settings.reduceMotion ? 0 : 0.7; return;
+    case 'dominating': audio.dominating(); banner(m.owner + ' is dominating!', `Steal sheep back within ${m.secs} seconds`); return;
+    case 'dom_broken': toast('Domination broken!', 'good'); return;
+    case 'gone': remotes.delete(m.id); view?.removeDog(m.id); return;
   }
-}
-
-function onSearchResult(m) {
-  S.search = null; view?.setDigging(false);
-  if (m.result === 'cancelled') { audio.searchCancel(); return toast('Search interrupted', 'bad'); }
-  if (m.result === 'nothing') { audio.nothing(); return toast('Nothing but hay…'); }
-  if (m.result === 'decoy') { audio.decoy(m.type); view?.spawnDecoy(m.type, m.x, m.z); toast(m.points ? `Found a ${m.type}! +${m.points}` : `Found a ${m.type}.`, 'good'); return; }
-  if (m.result === 'needle') { flash('#fff2b0'); }
 }
 
 // ------------------------------------------------------------------ snapshots and interpolation
 function onSnap(m) {
   const now = performance.now();
-  for (const [id, x, y, z, yaw, pitch, f] of m.p) {
+  for (const [id, x, z, yaw, f] of m.p) {
     if (id === S.you) continue;
     let r = remotes.get(id); if (!r) { r = { buf: [], stepD: 0, last: null }; remotes.set(id, r); }
-    r.buf.push({ t: now, x, y, z, yaw, pitch, f }); if (r.buf.length > 12) r.buf.shift();
+    r.buf.push({ t: now, x, z, yaw, f }); if (r.buf.length > 12) r.buf.shift();
   }
 }
-const lerpAng = (a, b, t) => { let d = ((b - a + Math.PI) % (Math.PI * 2) + Math.PI * 2) % (Math.PI * 2) - Math.PI; return a + d * t; };
 function updateRemotes(dt) {
-  const rt = performance.now() - 130;
+  const rt = performance.now() - 120;
   for (const [id, r] of remotes) {
     const b = r.buf; if (!b.length) continue;
     let a = b[0], c = b[b.length - 1];
-    if (rt >= c.t) { a = c; }
-    else { for (let i = b.length - 1; i > 0; i--) if (b[i - 1].t <= rt) { a = b[i - 1]; c = b[i]; break; } }
+    if (rt >= c.t) a = c; else { for (let i = b.length - 1; i > 0; i--) if (b[i - 1].t <= rt) { a = b[i - 1]; c = b[i]; break; } }
     const k = a === c || c.t === a.t ? 1 : clamp((rt - a.t) / (c.t - a.t), 0, 1);
-    const d = { x: a.x + (c.x - a.x) * k, y: a.y + (c.y - a.y) * k, z: a.z + (c.z - a.z) * k, yaw: lerpAng(a.yaw, c.yaw, k), pitch: a.pitch + (c.pitch - a.pitch) * k, flags: c.f };
-    const info = S.room?.players.find(p => p.id === id); if (!info || !info.connected) { view.removeRemote(id); continue; }
-    view.setRemote(id, { ...d, name: info.name, team: S.teams[id] ?? info.team, cosm: info.cosm });
-    if (r.last && (c.f & 1)) { r.stepD += Math.hypot(d.x - r.last.x, d.z - r.last.z); if (r.stepD > ((c.f & 2) ? 2.1 : 1.6)) { r.stepD = 0; audio.footstep(W.surfaceAt(S.world, d.x, d.z), !!(c.f & 2), { id, dx: d.x - L.x, dz: d.z - L.z, yaw: L.yaw }); } }
-    if (c.f & 4 && Math.random() < dt * 5) audio.rustle({ id, dx: d.x - L.x, dz: d.z - L.z, yaw: L.yaw });
+    const d = { x: a.x + (c.x - a.x) * k, z: a.z + (c.z - a.z) * k, yaw: angLerp(a.yaw, c.yaw, k), flags: c.f };
+    const info = infoOf(id); if (!info || !info.connected) { view.removeDog(id); continue; }
+    view.setDog(id, { ...d, dt, name: info.name, cosm: { ...info.cosm, color: colorOf(id) } });
+    if (r.last && (c.f & 1)) { r.stepD += Math.hypot(d.x - r.last.x, d.z - r.last.z); if (r.stepD > ((c.f & 2) ? 2.3 : 1.8)) { r.stepD = 0; audio.footstep('grass', !!(c.f & 2), { id, dx: d.x - L.x, dz: d.z - L.z, yaw: L.camYaw }); } }
     r.last = d;
   }
-  for (const id of [...remotes.keys()]) if (!S.room?.players.some(p => p.id === id)) { remotes.delete(id); view.removeRemote(id); }
+  for (const id of [...remotes.keys()]) if (!S.room?.players.some(p => p.id === id)) { remotes.delete(id); view.removeDog(id); }
 }
 
-// ------------------------------------------------------------------ first-person controller
-function canMove() { return S.inGame && document.pointerLockElement === canvas && (S.phase === 'playing' || (S.phase === 'setup' && S.hider === S.you)); }
-function frozen() { return S.phase === 'countdown' || (S.phase === 'setup' && S.hider !== S.you); }
+// ------------------------------------------------------------------ dog controller
+const now = () => performance.now();
+function canMove() { return S.inGame && !S.spectator && document.pointerLockElement === canvas && S.phase === 'playing' && now() >= L.stunUntil; }
 
 function stepPlayer(dt) {
-  const active = canMove();
+  if (S.spectator) return spectateStep(dt);
+  const t = now(), active = canMove(), stunned = t < L.stunUntil;
   let ix = 0, iz = 0;
-  if (active) { if (keys.has('KeyW') || keys.has('ArrowUp')) iz -= 1; if (keys.has('KeyS') || keys.has('ArrowDown')) iz += 1; if (keys.has('KeyA') || keys.has('ArrowLeft')) ix -= 1; if (keys.has('KeyD') || keys.has('ArrowRight')) ix += 1; }
+  if (active) { if (keys.has('KeyW') || keys.has('ArrowUp')) iz -= 1; if (keys.has('KeyS') || keys.has('ArrowDown')) iz += 1; if (keys.has('KeyA')) ix -= 1; if (keys.has('KeyD')) ix += 1; }
+  if (S.inGame && S.phase === 'playing') { if (keys.has('ArrowLeft')) L.camYaw += 2.2 * dt; if (keys.has('ArrowRight')) L.camYaw -= 2.2 * dt; }
   const len = Math.hypot(ix, iz); if (len) { ix /= len; iz /= len; }
-  const wantSprint = active && (keys.has('ShiftLeft') || keys.has('ShiftRight')) && len > 0 && iz <= 0.01 + (ix ? 1 : 0) && L.stamina > 4;
-  L.sprinting = wantSprint && L.stamina > 0;
-  const pile = S.world ? W.pileAt(S.world, L.x, L.z) : null;
-  const slow = pile ? (pile.deep ? 0.62 : 0.84) : 1;
-  const target = (L.sprinting ? W.SPRINT_SPEED : W.WALK_SPEED) * slow * (S.search ? 0.15 : 1);
-  const sin = Math.sin(L.yaw), cos = Math.cos(L.yaw);
-  const tx = (ix * cos + iz * sin) * target, tz = (iz * cos - ix * sin) * target;
-  const acc = (L.onGround ? (len ? 11 : 9) : 2.5) * dt;
-  L.vx += (tx - L.vx) * Math.min(1, acc); L.vz += (tz - L.vz) * Math.min(1, acc);
-  L.moving = Math.hypot(L.vx, L.vz) > 0.6;
-  if (frozen() || !S.inGame || S.phase === 'results') { L.vx = L.vz = 0; L.moving = false; }
-  if (S.world && !frozen() && S.phase !== 'results') {
-    const nx = L.x + L.vx * dt, nz = L.z + L.vz * dt; const r = W.resolveCollision(S.world, nx, nz); L.x = r.x; L.z = r.z;
-  }
-  // jump / gravity
-  if (active && L.onGround && keys.has('Space') && !S.search) { L.vy = W.JUMP_VELOCITY * (pile && pile.deep ? 0.8 : 1); L.onGround = false; audio.jump(); }
-  if (!L.onGround) { L.vy -= W.GRAVITY * dt; L.y += L.vy * dt; if (L.y <= 0) { L.y = 0; if (L.wasAir && L.vy < -3) audio.land(L.vy < -8); L.vy = 0; L.onGround = true; } }
-  L.wasAir = !L.onGround;
-  if (L.y < -4 || !Number.isFinite(L.x + L.z + L.y)) { S.net?.send({ t: 'respawn' }); L.y = 0; L.vy = 0; }
-  // stamina
-  if (L.sprinting && L.moving) { L.stamina = Math.max(0, L.stamina - 24 * dt); L.staminaHold = 0.9; } else { L.staminaHold -= dt; if (L.staminaHold <= 0) L.stamina = Math.min(100, L.stamina + 16 * dt); }
-  // head bob / steps
-  const spd = Math.hypot(L.vx, L.vz);
-  if (L.onGround && spd > 0.8) {
-    L.bobT += dt * (L.sprinting ? 12 : 8.5) * (spd / W.WALK_SPEED > 1 ? 1 : 1);
-    const amp = settings.bob && !settings.reduceMotion ? (L.sprinting ? 0.075 : 0.045) : 0; L.bob = Math.sin(L.bobT) * amp;
-    L.stepD += spd * dt; if (L.stepD > (L.sprinting ? 2.6 : 1.95)) { L.stepD = 0; audio.footstep(W.surfaceAt(S.world, L.x, L.z), L.sprinting); }
-  } else { L.bob *= 0.85; }
-  const fovT = (settings.reduceMotion ? 75 : 75 + (L.sprinting && L.moving ? 7 : 0)); L.fov = fovT;
-  L.roll = settings.reduceMotion ? 0 : -ix * 0.012;
-  // search is cancelled by walking away
-  if (S.search && spd > 1.4) cancelSearch();
-  if (S.search && !S.search.sent && performance.now() - S.search.start >= S.search.ms) { S.search.sent = true; S.net?.send({ t: 'search_finish' }); }
-  // network position
-  sendT += dt; if (sendT >= 0.05 && S.inGame && (S.phase === 'playing' || (S.phase === 'setup' && S.hider === S.you))) { sendT = 0; S.net?.send({ t: 'pos', x: L.x, y: L.y, z: L.z, yaw: L.yaw, pitch: L.pitch, f: (L.moving ? 1 : 0) | (L.sprinting ? 2 : 0) | (L.onGround ? 0 : 16) }); }
+  const fx = -Math.sin(L.camYaw), fz = -Math.cos(L.camYaw), rx = Math.cos(L.camYaw), rz = -Math.sin(L.camYaw);
+  const dx = fx * -iz + rx * ix, dz = fz * -iz + rz * ix;
+  const wantSprint = active && (keys.has('ShiftLeft') || keys.has('ShiftRight')) && len > 0 && L.stamina > 3;
+  L.sprinting = wantSprint;
+  L.inMud = S.field ? !!mudAt(S.field, L.x, L.z) : false;
+  const dashing = t < L.dashUntil;
+  let tvx = 0, tvz = 0;
+  if (dashing) { tvx = L.dashDir[0] * TUNING.dashSpeed; tvz = L.dashDir[1] * TUNING.dashSpeed; }
+  else if (len) { const sp = (L.sprinting ? TUNING.dogSprint : TUNING.dogWalk) * (L.inMud ? TUNING.mudSlow : 1); tvx = dx * sp; tvz = dz * sp; }
+  const acc = Math.min(1, (dashing ? 30 : len ? 13 : 12) * dt);
+  L.vx += (tvx - L.vx) * acc; L.vz += (tvz - L.vz) * acc;
+  if (stunned || S.phase !== 'playing') { L.vx = L.vz = 0; }
+  L.moving = Math.hypot(L.vx, L.vz) > 0.7;
+  if (S.field && S.phase === 'playing' && !stunned) { const r = resolveCollision(S.field, L.x + L.vx * dt, L.z + L.vz * dt, DOG_RADIUS); L.x = r.x; L.z = r.z; }
+  if (L.moving && !stunned) { const ty = Math.atan2(-L.vx, -L.vz); L.dogYaw = angLerp(L.dogYaw, ty, Math.min(1, 16 * dt)); L.stepD += Math.hypot(L.vx, L.vz) * dt; if (L.stepD > (L.sprinting ? 2.4 : 1.8)) { L.stepD = 0; audio.footstep(L.inMud ? 'dirt' : 'grass', L.sprinting); } }
+  if (L.sprinting && L.moving) { L.stamina = Math.max(0, L.stamina - 30 * dt); L.staminaHold = 0.7; } else { L.staminaHold -= dt; if (L.staminaHold <= 0) L.stamina = Math.min(100, L.stamina + 22 * dt); }
+  L.barkAnim = Math.max(0, L.barkAnim - dt); L.howlAnim = Math.max(0, L.howlAnim - dt); L.shake = Math.max(0, L.shake - dt * 1.4);
+  const flags = (L.moving ? 1 : 0) | (L.sprinting ? 2 : 0) | (L.barkAnim > 0 ? 4 : 0) | (dashing ? 8 : 0) | (stunned ? 16 : 0) | (L.inMud ? 32 : 0) | (L.howlAnim > 0 ? 64 : 0);
+  const me = myInfo(); if (view && me) view.setDog(S.you, { x: L.x, z: L.z, yaw: L.dogYaw, flags, dt, you: true, name: me.name, cosm: { ...me.cosm, color: colorOf(S.you) } });
+  sendT += dt; if (sendT >= 0.05 && S.inGame && S.phase === 'playing' && !stunned) { sendT = 0; sendPos(); }
+}
+function sendPos() { S.net?.send({ t: 'pos', x: L.x, z: L.z, yaw: L.dogYaw, f: (L.moving ? 1 : 0) | (L.sprinting ? 2 : 0) }); }
+
+function doBark() {
+  if (!canMove() || now() < L.barkReady) return;
+  L.barkReady = now() + TUNING.barkCooldown * 1000; L.barkAnim = 0.45; sendPos(); S.net?.send({ t: 'bark' });
+  view?.bark(L.x, L.z, L.dogYaw); audio.bark(); L.shake = settings.reduceMotion ? 0 : 0.12;
+}
+function doHowl() {
+  if (!canMove() || now() < L.howlReady) return;
+  L.howlReady = now() + TUNING.howlCooldown * 1000; L.howlAnim = 0.8; sendPos(); S.net?.send({ t: 'howl' });
+  view?.howl(L.x, L.z); audio.howl();
+}
+function doDash() {
+  if (!canMove() || now() < L.dashReady) return;
+  L.dashReady = now() + TUNING.dashCooldown * 1000; L.dashUntil = now() + TUNING.dashDuration * 1000; L.dashDir = forward(L.dogYaw); sendPos(); S.net?.send({ t: 'dash' });
+  view?.dashFx(L.x, L.z); audio.dash();
 }
 
-function cancelSearch() { if (!S.search) return; S.search = null; view?.setDigging(false); S.net?.send({ t: 'search_cancel' }); }
-
-function interactTarget() {
-  for (const [id, n] of S.revealed) { const d = Math.hypot(n.x - L.x, n.z - L.z); if (d < 2.4) return { kind: 'needle', id, d }; }
-  if (S.phase === 'setup' && S.hider === S.you) return { kind: 'place' };
-  if (S.phase === 'playing' && S.hider !== S.you && S.world && W.pileAt(S.world, L.x, L.z, 1.3)) return { kind: 'search' };
-  return null;
+// Spectators watch another dog until the next round.
+function spectateStep(dt) {
+  const ids = [...remotes.keys()]; if (!ids.length) return;
+  if (S.spectateId == null || !remotes.has(S.spectateId)) S.spectateId = ids[0];
+  const r = remotes.get(S.spectateId)?.last; if (r) { L.x = r.x; L.z = r.z; }
 }
-
-function interact() {
-  if (!canMove()) return;
-  const t = interactTarget(); if (!t) return;
-  if (t.kind === 'needle') S.net?.send({ t: 'pickup', id: t.id });
-  else if (t.kind === 'place') S.net?.send({ t: 'place_needle' });
-  else if (t.kind === 'search' && !S.search) S.net?.send({ t: 'search_start' });
-}
-
-function disturbHay() {
-  const now = performance.now(); if (now - lastClick < 280 || !canMove() || S.search) return; lastClick = now;
-  const px = L.x - Math.sin(L.yaw) * 1.5, pz = L.z - Math.cos(L.yaw) * 1.5, inPile = W.pileAt(S.world, px, pz, 0.4);
-  if (inPile) { view.strawBurst(px, 0.5, pz, 12, 3.6); audio.rustle(); } else audio.rustle();
-}
+function cycleSpectate() { const ids = [...remotes.keys()]; if (!ids.length) return; S.spectateId = ids[(ids.indexOf(S.spectateId) + 1) % ids.length]; toast('Watching ' + (infoOf(S.spectateId)?.name || 'a dog')); }
 
 // ------------------------------------------------------------------ input
 function releaseLock() { lockWanted = false; if (document.pointerLockElement) document.exitPointerLock(); }
@@ -292,35 +281,30 @@ function bindInput() {
   document.addEventListener('keydown', e => {
     if (e.target.closest?.('input,textarea,select')) { if (e.key === 'Enter' && e.target.id === 'chatIn') sendChat(); return; }
     if (e.code === 'Tab') { e.preventDefault(); if (S.inGame) { S.tabDown = true; $('#scoreboard').classList.add('show'); updateScoreboard(); } return; }
-    if (['Space', 'ArrowUp', 'ArrowDown'].includes(e.code) && S.inGame) e.preventDefault();
+    if (['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.code) && S.inGame) e.preventDefault();
     if (e.repeat) return; keys.add(e.code);
     if (!S.inGame) return;
-    if (e.code === 'KeyE') interact();
-    if (e.code === 'KeyQ' || e.code === 'KeyF') toggleDetector();
+    if (e.code === 'Space') { S.spectator ? cycleSpectate() : doDash(); }
+    if (e.code === 'KeyF') doBark();
+    if (e.code === 'KeyE' || e.code === 'KeyQ') doHowl();
   });
   document.addEventListener('keyup', e => { keys.delete(e.code); if (e.code === 'Tab') { S.tabDown = false; $('#scoreboard')?.classList.remove('show'); } });
   window.addEventListener('blur', () => { keys.clear(); S.tabDown = false; $('#scoreboard')?.classList.remove('show'); });
   document.addEventListener('mousemove', e => {
     if (document.pointerLockElement !== canvas || !S.inGame) return;
-    const k = 0.0022 * settings.sens; L.yaw -= clamp(e.movementX, -250, 250) * k; L.pitch = clamp(L.pitch - clamp(e.movementY, -250, 250) * k, -1.5, 1.5);
+    const k = 0.0022 * settings.sens; L.camYaw -= clamp(e.movementX, -250, 250) * k; L.camPitch = clamp(L.camPitch + clamp(e.movementY, -250, 250) * k * 0.7, 0.2, 1.0);
   });
-  document.addEventListener('mousedown', e => { if (e.button === 0 && document.pointerLockElement === canvas) disturbHay(); });
+  document.addEventListener('mousedown', e => { if (document.pointerLockElement !== canvas || !S.inGame) return; if (e.button === 0) { S.spectator ? cycleSpectate() : doBark(); } else if (e.button === 2) doHowl(); });
   document.addEventListener('pointerlockchange', () => {
     const locked = document.pointerLockElement === canvas;
-    if (!locked && lockWanted && S.inGame && S.phase !== 'results' && S.screen === 'game') { lockWanted = false; showPause(); if (S.search) cancelSearch(); }
+    if (!locked && lockWanted && S.inGame && S.phase !== 'results' && S.screen === 'game') { lockWanted = false; showPause(); }
     if (locked) { hidePause(); audio.unlock(); }
   });
   document.addEventListener('pointerlockerror', () => toast('Could not capture the mouse. Click the game and try again.', 'bad'));
-  document.addEventListener('visibilitychange', () => { if (document.hidden) { audio.suspend(); } else audio.resume(); });
+  document.addEventListener('visibilitychange', () => { if (document.hidden) audio.suspend(); else audio.resume(); });
   document.addEventListener('contextmenu', e => { if (S.inGame) e.preventDefault(); });
   document.addEventListener('click', e => { if (e.target.closest?.('button')) audio.click(); }, true);
   document.addEventListener('mouseover', e => { if (e.target.closest?.('button:not(:disabled)')) audio.hover(); });
-}
-
-function toggleDetector() {
-  if (!S.det.avail || S.phase !== 'playing' || S.hider === S.you) return;
-  const on = !S.det.on; if (on && S.det.battery < 15) { audio.detLow(); return toast('Battery too low. Let it recharge.', 'bad'); }
-  S.net?.send({ t: 'detector', on }); S.det.on = on; on ? audio.detOn() : audio.detOff(); S.det.level = 0; view?.setDetector(on, 0); updateDetHud();
 }
 
 // ------------------------------------------------------------------ frame loop
@@ -328,31 +312,33 @@ function frame(ts) {
   rafId = requestAnimationFrame(frame);
   const dt = Math.min(0.05, (ts - lastFrame) / 1000 || 0.016); lastFrame = ts;
   if (!S.inGame || !view) return;
-  stepPlayer(dt); updateRemotes(dt); detectorBeeps(dt); updateHud(dt);
-  view.render(dt, { x: L.x, y: L.y, z: L.z, yaw: L.yaw, pitch: L.pitch, eye: L.eye, bob: L.bob, roll: L.roll, fov: L.fov });
+  stepPlayer(dt); updateRemotes(dt); ambientSheep(dt); updateHud(dt);
+  view.render(dt, { x: L.x, z: L.z, yaw: L.camYaw, pitch: L.camPitch, dist: 9.5, shake: settings.reduceMotion ? 0 : L.shake * 0.5, fov: L.dashUntil > now() && !settings.reduceMotion ? 70 : 62 });
 }
-
-function detectorBeeps(dt) {
-  if (!S.det.on || S.phase !== 'playing') return;
-  const s = S.det.level; if (s <= 0.02) return;
-  S.det.nextBeep -= dt; if (S.det.nextBeep <= 0) { audio.beep(s); S.det.nextBeep = 1.4 - 1.28 * Math.pow(s, 0.8); }
-  view.setDetector(true, s);
+function ambientSheep(dt) { // the odd "baa" from panicking sheep near you
+  baaT -= dt; if (baaT > 0 || S.phase !== 'playing') return; baaT = 0.7 + Math.random() * 1.6; const a = S.sheep; if (!a?.length) return;
+  for (let tries = 0; tries < 6; tries++) { const i = Math.floor(Math.random() * (a.length / 4)); if (!(a[i * 4 + 3] & 2)) continue; const dx = a[i * 4] / 10 - L.x, dz = a[i * 4 + 1] / 10 - L.z; audio.baa({ dx, dz, yaw: L.camYaw }); return; }
 }
 
 // ------------------------------------------------------------------ HUD
 function buildHud() {
+  mini = h('canvas', { id: 'mini', width: 220, height: 220 }); miniCtx = mini.getContext('2d');
   hud = h('div', { id: 'hud' },
-    h('div', { id: 'hudTL', class: 'panel' }, h('div', { id: 'hudName' }), h('div', { class: 'row' }, h('span', { class: 'lbl' }, 'ROUND'), h('b', { id: 'hudRound' }, '0')), h('div', { class: 'row' }, h('span', { class: 'lbl' }, 'TOTAL'), h('b', { id: 'hudTotal' }, '0')), h('div', { class: 'row' }, h('span', { class: 'lbl' }, 'PLAYERS'), h('b', { id: 'hudPlayers' }, '1'))),
-    h('div', { id: 'hudTop' }, h('div', { id: 'hudTimer', class: 'panel' }, '0:00'), h('div', { id: 'hudObj' }), h('div', { id: 'hudTeams' })),
-    h('div', { id: 'cross' }), h('div', { id: 'prompt' }),
-    h('div', { id: 'searchBar' }, h('div', { id: 'searchFill' }), h('span', { id: 'searchTxt' }, 'Searching…')),
-    h('div', { id: 'stam' }, h('div', { id: 'stamFill' })),
-    h('div', { id: 'det', class: 'panel' }, h('div', { class: 'lbl' }, 'METAL DETECTOR  [Q]'), h('div', { id: 'detMeter' }, h('div', { id: 'detFill' })), h('div', { class: 'row' }, h('span', { class: 'lbl' }, 'BATTERY'), h('div', { id: 'batt' }, h('div', { id: 'battFill' })))),
+    h('div', { id: 'hudTL', class: 'panel' }, h('div', { id: 'hudName' }), h('div', { class: 'row' }, h('span', { class: 'lbl' }, 'Your pen'), h('b', { id: 'hudPen' }, '0')), h('div', { class: 'row' }, h('span', { class: 'lbl' }, 'Penned by you'), h('b', { id: 'hudHerded' }, '0')), h('div', { class: 'row' }, h('span', { class: 'lbl' }, 'Steals'), h('b', { id: 'hudSteals' }, '0'))),
+    h('div', { id: 'hudTop' }, h('div', { id: 'hudTimer', class: 'panel' }, '0:00'), h('div', { id: 'hudObj' }), h('div', { id: 'hudDom' })),
+    h('div', { id: 'hudPens', class: 'panel' }),
+    h('div', { id: 'penArrowBox' }, h('div', { id: 'penArrow' }, '➤'), h('div', { id: 'penDist' })),
+    h('div', { id: 'abil' },
+      h('div', { class: 'ab', id: 'abBark' }, h('i', { class: 'cd' }), h('kbd', null, 'Click'), h('span', null, 'Bark')),
+      h('div', { class: 'ab', id: 'abDash' }, h('i', { class: 'cd' }), h('kbd', null, 'Space'), h('span', null, 'Dash')),
+      h('div', { class: 'ab', id: 'abHowl' }, h('i', { class: 'cd' }), h('kbd', null, 'E'), h('span', null, 'Howl')),
+      h('div', { class: 'stam' }, h('div', { id: 'stamFill' }), h('span', null, 'Shift: sprint'))),
+    h('div', { id: 'stunMsg' }, 'STUNNED'),
+    h('div', { id: 'spec' }, 'Spectating — click or Space to switch dog'),
+    h('div', { id: 'miniWrap', class: 'panel' }, mini),
     h('div', { id: 'bigBanner' }, h('div', { id: 'bbTitle' }), h('div', { id: 'bbSub' })),
-    h('div', { id: 'flash' }),
-    h('div', { id: 'ping' }, ''),
-    h('div', { id: 'scoreboard', class: 'panel' }),
-  );
+    h('div', { id: 'flash' }), h('div', { id: 'ping' }, ''),
+    h('div', { id: 'scoreboard', class: 'panel' }));
   return hud;
 }
 let bannerT = 0;
@@ -361,37 +347,58 @@ function flash(color) { if (settings.reduceFlash) return; const f = $('#flash');
 function updatePing() { const p = $('#ping'); if (p && S.net?.rtt) p.textContent = Math.round(S.net.rtt) + ' ms'; }
 function updateObjective() {
   const o = $('#hudObj'); if (!o || !S.round) return; const m = S.round.mode;
-  let t = { classic: 'Find the needle before anyone else', team: 'Find YOUR team\'s needle first', golden: 'Find the GOLDEN needle', endless: 'Find as many needles as you can', hideseek: S.hider === S.you ? 'Hide the needle in a hay pile' : 'Find the hidden needle' }[m] || '';
-  if (S.phase === 'countdown') t = 'Get ready…'; o.textContent = t;
-  const teams = $('#hudTeams'); if (teams) { const me = S.room?.players.find(p => p.id === S.you); teams.textContent = m === 'team' && me?.team != null ? (me.team === 0 ? '● RED TEAM' : '● BLUE TEAM') : ''; teams.className = me?.team === 0 ? 'red' : 'blue'; }
+  let t = m === 'team' ? 'Herd sheep into your team\'s pen' : S.practice ? 'Run at the sheep to scare them toward your pen' : 'Herd sheep into your pen. Steal from rivals.';
+  if (m === 'stampede') t = 'Stampede: storms keep spooking the flock';
+  if (S.spectator) t = 'Waiting for the next round…'; if (S.phase === 'countdown') t = 'Get ready…'; o.textContent = t;
 }
 function updateHudStatic() {
-  const me = S.room?.players.find(p => p.id === S.you); if (!me || !$('#hudName')) return;
-  $('#hudName').textContent = me.name; $('#hudPlayers').textContent = S.room.players.filter(p => p.connected).length;
-  const sc = S.scores.get(S.you); if (sc) { $('#hudRound').textContent = sc.round; $('#hudTotal').textContent = sc.total; }
-  updateObjective();
+  const me = myInfo(); if (!me || !$('#hudName')) return; $('#hudName').textContent = me.name + (teamMode() && me.team != null ? ` · ${TEAM_NAME[me.team]}` : '');
+  $('#hudName').style.color = colorOf(S.you); updateObjective();
 }
-function updateDetHud() { const d = $('#det'); if (!d) return; d.style.display = S.det.avail && S.hider !== S.you ? 'block' : 'none'; d.classList.toggle('on', S.det.on); $('#detFill').style.width = (S.det.on ? S.det.level * 100 : 0) + '%'; $('#battFill').style.width = S.det.battery + '%'; $('#battFill').style.background = S.det.battery < 20 ? '#e0533d' : '#e6b94a'; }
 function updateScoreboard() {
-  const sb = $('#scoreboard'); if (!sb || !S.room) return;
-  const rows = [...S.room.players].map(p => ({ p, s: S.scores.get(p.id) || { round: 0, total: 0, needles: 0 } })).sort((a, b) => b.s.round - a.s.round || b.s.total - a.s.total);
-  const showTeam = S.round?.mode === 'team';
-  sb.replaceChildren(h('div', { class: 'sbTitle' }, 'SCOREBOARD'), h('table', null, h('thead', null, h('tr', null, h('th', null, '#'), h('th', null, 'Player'), showTeam && h('th', null, 'Team'), h('th', null, 'Round'), h('th', null, 'Total'), h('th', null, 'Needles'), h('th', null, ''))),
-    h('tbody', null, rows.map((r, i) => h('tr', { class: r.p.id === S.you ? 'me' : '' }, h('td', null, i + 1), h('td', null, h('span', { class: 'dot', style: `background:${r.p.cosm.color}` }), r.p.name, r.p.host ? ' 👑' : ''), showTeam && h('td', null, r.p.team === 0 ? 'Red' : r.p.team === 1 ? 'Blue' : '-'), h('td', null, r.s.round), h('td', null, r.s.total), h('td', null, r.s.needles), h('td', { class: r.p.connected ? 'okc' : 'badc' }, r.p.connected ? '●' : 'offline'))))));
+  const mySlot = S.round?.you?.slot, sc = S.scores, mine = sc.pens.find(p => p[0] === mySlot), pl = sc.players.get(S.you);
+  if ($('#hudPen')) { $('#hudPen').textContent = mine ? `${mine[2]} sheep · ${mine[1]} pts` : '0'; $('#hudHerded').textContent = pl?.herded ?? 0; $('#hudSteals').textContent = pl?.steals ?? 0; }
+  const box = $('#hudPens'); if (box && S.field) {
+    const rows = sc.pens.slice().sort((a, b) => b[1] - a[1]).map(([slot, v, n]) => h('div', { class: 'pr' + (slot === mySlot ? ' me' : '') }, h('span', { class: 'dot', style: `background:${slotColor(slot)}` }), h('span', { class: 'pn' }, slotName(slot)), h('b', null, v), h('i', { class: 'bar' }, h('u', { style: `width:${Math.min(100, v / sc.total * 100)}%;background:${slotColor(slot)}` }))));
+    box.replaceChildren(h('div', { class: 'lbl' }, 'Pens · ' + sc.total + ' pts of sheep'), ...rows); box.style.display = rows.length > 1 || !S.practice ? 'block' : 'none';
+  }
+  const sb = $('#scoreboard'); if (sb && S.room && S.tabDown) {
+    const rows = [...S.room.players].filter(p => S.slots[p.id] != null).map(p => ({ p, s: sc.players.get(p.id) || { score: 0, herded: 0, steals: 0 } })).sort((a, b) => b.s.score - a.s.score);
+    sb.replaceChildren(h('div', { class: 'sbTitle' }, 'Scoreboard'), h('table', null, h('thead', null, h('tr', null, ['#', 'Dog', 'Pen pts', 'Penned', 'Steals', ''].map(x => h('th', null, x)))),
+      h('tbody', null, rows.map((r, i) => h('tr', { class: r.p.id === S.you ? 'me' : '' }, h('td', null, i + 1), h('td', null, h('span', { class: 'dot', style: `background:${colorOf(r.p.id)}` }), r.p.name, r.p.host ? ' 👑' : ''), h('td', null, r.s.score), h('td', null, r.s.herded), h('td', null, r.s.steals), h('td', { class: r.p.connected ? 'okc' : 'badc' }, r.p.connected ? '●' : 'offline'))))));
+  }
 }
+function setCd(id, readyAt, total) { const el = $(id); if (!el) return; const left = Math.max(0, readyAt - now()); el.classList.toggle('rdy', left <= 0); $('.cd', el).style.height = Math.min(100, left / total * 100) + '%'; }
 function updateHud(dt) {
-  const t = S.phase === 'playing' || S.phase === 'setup' || S.phase === 'countdown' ? Math.max(0, S.remaining - (performance.now() - S.lastTimerAt)) : 0;
-  const tm = $('#hudTimer'); if (tm) { tm.textContent = S.phase === 'countdown' ? 'GET READY' : S.phase === 'setup' ? 'HIDE ' + fmtTime(t) : fmtTime(t); tm.classList.toggle('low', S.phase === 'playing' && t < 15000); }
-  if (S.phase === 'countdown') { const cd = Math.ceil(S.phaseMs - (performance.now() - S.lastTimerAt)) / 1000; const n = Math.ceil(cd); if (n > 0 && n <= 3 && S.lastCd !== n) { S.lastCd = n; audio.tick(false); $('#bbTitle').textContent = n; $('#bbSub').textContent = ''; const b = $('#bigBanner'); b.classList.remove('show'); void b.offsetWidth; b.classList.add('show'); } } else S.lastCd = 0;
-  const tgt = interactTarget(), p = $('#prompt');
-  let txt = '';
-  if (canMove() && !S.search && tgt) txt = tgt.kind === 'needle' ? '[E]  Pick up the needle' : tgt.kind === 'place' ? '[E]  Hide the needle here' : '[E]  Search the hay   •   [Click] Scatter';
-  if (!canMove() && S.inGame && S.phase !== 'results' && !$('#pause')) txt = '';
-  p.textContent = txt; p.style.opacity = txt ? 1 : 0; p.classList.toggle('needle', tgt?.kind === 'needle');
-  const sb = $('#searchBar'); if (S.search) { sb.style.display = 'block'; $('#searchFill').style.width = clamp((performance.now() - S.search.start) / S.search.ms, 0, 1) * 100 + '%'; } else sb.style.display = 'none';
-  $('#stamFill').style.width = L.stamina + '%'; $('#stam').style.opacity = L.stamina < 99 ? 0.9 : 0;
-  if (S.det.avail) { if (S.det.on) { /* local drain estimate between server updates */ } updateDetHud(); }
-  if (dt) { const fl = S.search ? 1 : 0; document.body.classList.toggle('searching', !!fl); }
+  const t = S.phase === 'playing' || S.phase === 'countdown' ? Math.max(0, S.remaining - (now() - S.lastTimerAt)) : 0;
+  const tm = $('#hudTimer'); if (tm) { tm.textContent = S.phase === 'countdown' ? 'GET READY' : fmtTime(t); tm.classList.toggle('low', S.phase === 'playing' && t < 15000); }
+  if (S.phase === 'countdown') { const n = Math.ceil((S.phaseMs - (now() - S.lastTimerAt)) / 1000); if (n > 0 && n <= 3 && S.lastCd !== n) { S.lastCd = n; audio.tick(false); $('#bbTitle').textContent = n; $('#bbSub').textContent = ''; const b = $('#bigBanner'); b.classList.remove('show'); void b.offsetWidth; b.classList.add('show'); } } else S.lastCd = 0;
+  setCd('#abBark', L.barkReady, TUNING.barkCooldown * 1000); setCd('#abDash', L.dashReady, TUNING.dashCooldown * 1000); setCd('#abHowl', L.howlReady, TUNING.howlCooldown * 1000);
+  $('#stamFill').style.width = L.stamina + '%';
+  $('#abil').style.display = S.spectator ? 'none' : 'flex'; $('#spec').style.display = S.spectator ? 'block' : 'none';
+  $('#stunMsg').style.display = now() < L.stunUntil ? 'block' : 'none';
+  const dom = S.scores.dom, de = $('#hudDom'); if (de) { de.textContent = dom ? `${slotName(dom.slot)} is dominating: ${dom.left}s` : ''; de.style.color = dom ? slotColor(dom.slot) : ''; de.style.display = dom ? 'block' : 'none'; }
+  // arrow to your pen
+  const pen = S.field?.pens[S.round?.you?.slot ?? -1], ar = $('#penArrowBox');
+  if (pen && !S.spectator && S.phase === 'playing') {
+    const dx = pen.cx - L.x, dz = pen.cz - L.z, d = Math.hypot(dx, dz);
+    const fx = -Math.sin(L.camYaw), fz = -Math.cos(L.camYaw), rx = Math.cos(L.camYaw), rz = -Math.sin(L.camYaw);
+    const sx = dx * rx + dz * rz, up = dx * fx + dz * fz, theta = Math.atan2(-up, sx) * 180 / Math.PI;
+    ar.style.display = d > 8 ? 'flex' : 'none'; $('#penArrow').style.transform = `rotate(${theta}deg)`; $('#penArrow').style.color = slotColor(pen.slot); $('#penDist').textContent = Math.round(d) + ' m to your pen';
+  }
+  else if (ar) ar.style.display = 'none';
+  miniT -= dt; if (miniT <= 0) { miniT = 0.05; drawMini(); }
+}
+function drawMini() {
+  const f = S.field; if (!f || !miniCtx) return; const g = miniCtx, W = mini.width, H = f.half, k = W / (2 * H + 4), X = x => (x + H + 2) * k, Z = z => (z + H + 2) * k;
+  g.clearRect(0, 0, W, W); g.fillStyle = '#5c9a43'; g.fillRect(X(-H), Z(-H), 2 * H * k, 2 * H * k);
+  g.fillStyle = 'rgba(95,63,39,.85)'; for (const m of f.mud) { g.beginPath(); g.arc(X(m.x), Z(m.z), m.r * k, 0, TAU); g.fill(); }
+  for (const p of f.pens) { g.fillStyle = slotColor(p.slot) + 'cc'; g.fillRect(X(p.rect.minX), Z(p.rect.minZ), (p.rect.maxX - p.rect.minX) * k, (p.rect.maxZ - p.rect.minZ) * k); }
+  g.fillStyle = '#3e2a17'; for (const s of f.solids) g.fillRect(X(s.minX), Z(s.minZ), Math.max(1.5, s.w * k), Math.max(1.5, s.d * k));
+  const a = S.sheep; for (let i = 0; i < a.length / 4; i++) { const t = f.sheep[i]?.type; g.fillStyle = t === 'g' ? '#ffd23f' : t === 'b' ? '#222' : '#fff'; g.beginPath(); g.arc(X(a[i * 4] / 10), Z(a[i * 4 + 1] / 10), t === 'g' ? 3.2 : 2.2, 0, TAU); g.fill(); if (t === 'b') { g.strokeStyle = '#fff'; g.lineWidth = 0.6; g.stroke(); } }
+  for (const [id, r] of remotes) if (r.last) { g.fillStyle = colorOf(id); g.beginPath(); g.arc(X(r.last.x), Z(r.last.z), 3.8, 0, TAU); g.fill(); g.strokeStyle = '#000'; g.lineWidth = 1; g.stroke(); }
+  if (!S.spectator) { g.save(); g.translate(X(L.x), Z(L.z)); g.rotate(-L.dogYaw); g.fillStyle = colorOf(S.you); g.strokeStyle = '#fff'; g.lineWidth = 1.6; g.beginPath(); g.moveTo(0, -7); g.lineTo(5, 5); g.lineTo(-5, 5); g.closePath(); g.fill(); g.stroke(); g.restore(); }
+  g.strokeStyle = 'rgba(255,255,255,.7)'; g.lineWidth = 1.2; g.strokeRect(X(-H), Z(-H), 2 * H * k, 2 * H * k);
 }
 
 // ------------------------------------------------------------------ screens
@@ -401,15 +408,14 @@ function setScreen(name) { S.screen = name; document.body.dataset.screen = name;
 
 function logo(small) {
   return h('div', { class: 'logo' + (small ? ' small' : ''), html: `
-  <svg viewBox="0 0 420 150" role="img" aria-label="Needle in a Haystack logo">
-    <defs><linearGradient id="gh" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#f3d27a"/><stop offset="1" stop-color="#c8963a"/></linearGradient></defs>
-    <g stroke="#7a5420" stroke-width="1.6" stroke-linecap="round" fill="none" opacity=".95">
-      <path d="M70 128 C40 118 28 96 44 80 C46 56 74 44 96 52 C108 30 150 24 170 44 C196 28 240 30 256 52 C284 46 318 58 322 84 C346 92 350 120 322 128 Z" fill="url(#gh)"/>
-      ${Array.from({ length: 46 }, (_, i) => { const x = 50 + i * 6; const y = 70 + ((i * 37) % 40); const a = ((i * 53) % 50) - 25; return `<path d="M${x} ${y + 40} q${a / 3} -22 ${a} -${28 + (i % 4) * 5}"/>`; }).join('')}
+  <svg viewBox="0 0 460 170" role="img" aria-label="Flock Rush logo">
+    <g class="logoSheep" fill="#f4f1ea" stroke="#1b3a22" stroke-width="3" stroke-linejoin="round">
+      <g transform="translate(300 96)"><ellipse rx="34" ry="24"/><circle cx="-26" cy="-18" r="13"/><ellipse cx="-34" cy="-16" rx="9" ry="10" fill="#2b2622"/><g fill="#2b2622" stroke="none"><rect x="-18" y="18" width="6" height="18"/><rect x="12" y="18" width="6" height="18"/></g></g>
+      <g transform="translate(372 108) scale(.8)"><ellipse rx="34" ry="24"/><ellipse cx="-34" cy="-6" rx="9" ry="10" fill="#2b2622"/><g fill="#2b2622" stroke="none"><rect x="-18" y="18" width="6" height="18"/><rect x="12" y="18" width="6" height="18"/></g></g>
+      <g transform="translate(418 118) scale(.62)"><ellipse rx="34" ry="24" fill="#f3c63c"/><ellipse cx="-34" cy="-6" rx="9" ry="10" fill="#2b2622"/></g>
     </g>
-    <g transform="translate(236 78) rotate(-24)"><rect x="-34" y="-1.6" width="68" height="3.2" rx="1.6" fill="#e9eef3" stroke="#59616a" stroke-width=".6"/><ellipse cx="-30" cy="0" rx="2.4" ry="1.1" fill="#59616a"/><path d="M34 0 L44 0" stroke="#e9eef3" stroke-width="1.2"/></g>
-    <g class="twinkle" transform="translate(262 62)"><path d="M0 -9 L1.6 -1.6 L9 0 L1.6 1.6 L0 9 L-1.6 1.6 L-9 0 L-1.6 -1.6 Z" fill="#fff8d0"/></g>
-  </svg><div class="logoTxt"><span>NEEDLE</span><small>in a</small><span>HAYSTACK</span></div>` });
+    <g transform="translate(110 84)" stroke="#1b3a22" stroke-width="3" stroke-linejoin="round"><path d="M-70 14 q10 -30 50 -26 l40 -22 q10 -5 18 4 l8 18 q10 6 6 16 l-10 4 q-6 22 -26 24 l-62 0 q-18 -2 -24 -18z" fill="#e4472f"/><path d="M34 -18 l16 -22 l6 24z" fill="#8c2517"/><path d="M-70 14 q-18 -10 -20 -34" fill="none" stroke="#e4472f" stroke-width="9" stroke-linecap="round"/><circle cx="46" cy="-10" r="3" fill="#1b3a22" stroke="none"/><path d="M-30 40 l0 22 M10 40 l0 22 M34 36 l10 22" stroke="#8c2517" stroke-width="9" stroke-linecap="round" fill="none"/></g>
+  </svg><div class="logoTxt"><span>FLOCK</span><span class="rush">RUSH</span></div>` });
 }
 
 function goMenu() {
@@ -421,7 +427,7 @@ function goMenu() {
   const go = async (intent) => { audio.unlock(); busy('Connecting…'); try { S.net?.close(); S.net = new OnlineNet(); await S.net.open(intent); } catch (e) { unbusy(); offlineNotice(); } };
   const startOnline = type => { const n = name(); if (!n) return; go({ t: type, name: n, token: undefined }); };
   ui.append(h('div', { class: 'menu' },
-    logo(),
+    logo(), h('p', { class: 'tag' }, 'Be the sheepdog. Scare the flock into your pen before the other dogs do.'),
     h('div', { class: 'menuCard panel' },
       nameIn,
       h('div', { class: 'btnCol' },
@@ -431,7 +437,7 @@ function goMenu() {
         h('div', { class: 'divider' }),
         h('button', { class: 'btn', onclick: practiceMenu }, 'Practice Mode'),
         h('div', { class: 'btnRow' }, h('button', { class: 'btn ghost', onclick: settingsScreen }, 'Settings'), h('button', { class: 'btn ghost', onclick: howTo }, 'How to Play')))),
-    h('div', { class: 'foot' }, 'Practice works offline. Online rooms hold 2–12 players.')));
+    h('div', { class: 'foot' }, 'Practice works offline. Online rooms hold 2–12 dogs. Desktop browser with a mouse and keyboard.')));
   codeIn.addEventListener('keydown', e => { if (e.key === 'Enter') $('.joinRow .btn').click(); });
   nameIn.addEventListener('keydown', e => { if (e.key === 'Enter') $('.btn.primary').click(); });
 }
@@ -444,18 +450,19 @@ function offlineNotice() {
 }
 
 function practiceMenu() {
-  let diff = 'normal';
-  const m = h('div', { class: 'modal' }, h('div', { class: 'panel modalBody' }, h('h2', null, 'Practice Mode'), h('p', null, 'A solo hunt in the full arena — no connection needed. Try the detector and learn the controls.'),
-    h('div', { class: 'seg', id: 'diffSeg' }, ['easy', 'normal', 'hard'].map(d => h('button', { class: 'segBtn' + (d === diff ? ' on' : ''), onclick: e => { diff = d; for (const b of $('#diffSeg').children) b.classList.remove('on'); e.target.classList.add('on'); } }, d[0].toUpperCase() + d.slice(1)))),
-    h('div', { class: 'btnRow' }, h('button', { class: 'btn primary', onclick: () => { m.remove(); startPractice(diff); } }, 'Start'), h('button', { class: 'btn', onclick: () => m.remove() }, 'Cancel'))));
+  const opt = { diff: 'normal', flock: 'normal', storms: false, mode: 'ffa' };
+  const seg = (id, key, list) => h('div', { class: 'seg', id }, list.map(([v, l]) => h('button', { class: 'segBtn' + (opt[key] === v ? ' on' : ''), onclick: e => { opt[key] = v; for (const b of $('#' + id).children) b.classList.remove('on'); e.target.classList.add('on'); } }, l)));
+  const m = h('div', { class: 'modal' }, h('div', { class: 'panel modalBody' }, h('h2', null, 'Practice Mode'), h('p', null, 'A solo round with no connection needed. Pen the whole flock before time runs out — or just learn how the sheep react.'),
+    h('div', { class: 'lbl' }, 'Sheep nerves'), seg('dSeg', 'diff', [['easy', 'Calm'], ['normal', 'Normal'], ['hard', 'Jumpy']]),
+    h('div', { class: 'lbl' }, 'Flock size'), seg('fSeg', 'flock', [['small', 'Small'], ['normal', 'Normal'], ['large', 'Large']]),
+    h('div', { class: 'lbl' }, 'Weather'), seg('wSeg', 'mode', [['ffa', 'Clear skies'], ['stampede', 'Thunderstorms']]),
+    h('div', { class: 'btnRow' }, h('button', { class: 'btn primary', onclick: () => { m.remove(); startPractice(opt); } }, 'Start'), h('button', { class: 'btn', onclick: () => m.remove() }, 'Cancel'))));
   document.body.append(m);
 }
-
-function startPractice(diff) {
+function startPractice(opt) {
   const typed = $('#nameIn')?.value.trim(); if (typed && typed.length >= 2) { settings.name = typed; saveSettings(); }
-  audio.unlock(); S.net?.close(); S.net = new LocalNet(); S.practice = true;
-  S.net.open({ t: 'create', name: settings.name || 'Farmer', practice: true, difficulty: diff });
-  S.practiceDiff = diff;
+  audio.unlock(); S.net?.close(); S.net = new LocalNet(); S.practice = true; S.practiceOpt = opt;
+  S.net.open({ t: 'create', name: settings.name || 'Rover', practice: true, difficulty: opt.diff, flock: opt.flock, mode: opt.mode, storms: opt.mode === 'stampede' });
 }
 
 // ----- lobby
@@ -471,35 +478,34 @@ function renderLobby() {
   const chatLog = h('div', { id: 'chatLog' }), chatIn = h('input', { id: 'chatIn', maxLength: 160, placeholder: 'Say something…', autocomplete: 'off' });
   const prevChat = $('#chatLog')?.scrollTop;
   const modeCards = Object.entries(MODES).map(([k, v]) => h('button', { class: 'modeCard' + (set.mode === k ? ' on' : ''), disabled: !host, title: v.desc, onclick: () => S.net.send({ t: 'settings', mode: k }) }, h('b', null, v.label), h('small', null, v.desc)));
-  const canStart = host;
   const live = R.players.filter(p => p.connected).length;
   root.replaceChildren(
     h('div', { class: 'lobbyTop' }, logo(true),
       h('div', { class: 'invite panel' }, h('div', null, h('small', null, 'ROOM CODE'), h('div', { class: 'code' }, R.code)), h('div', { class: 'inviteLink' }, h('input', { readOnly: true, value: inviteUrl(), onfocus: e => e.target.select() }), h('button', { class: 'btn', onclick: async () => { try { await navigator.clipboard.writeText(inviteUrl()); toast('Invite link copied!', 'good'); } catch { $('.inviteLink input').select(); document.execCommand?.('copy'); toast('Invite link selected — press Ctrl+C.'); } } }, 'Copy Invite Link'))),
       h('button', { class: 'btn ghost', onclick: leaveRoom }, 'Leave')),
     h('div', { class: 'lobbyGrid' },
-      h('div', { class: 'panel col' }, h('h3', null, `Players  ${live}/${set.maxPlayers}`),
+      h('div', { class: 'panel col' }, h('h3', null, `Dogs  ${live}/${set.maxPlayers}`),
         h('div', { class: 'plist' }, R.players.map(p => h('div', { class: 'prow' + (p.id === S.you ? ' me' : '') + (p.connected ? '' : ' off') }, h('span', { class: 'dot big', style: `background:${p.cosm.color}` }), h('span', { class: 'pname' }, p.name, p.host ? ' 👑' : ''), h('span', { class: 'pstat ' + (p.connected ? (p.ready || p.host ? 'ready' : 'wait') : 'offl') }, p.connected ? (p.host ? 'Host' : p.ready ? 'Ready' : 'Not ready') : 'Reconnecting…'), host && p.id !== S.you && h('button', { class: 'btn tiny danger', onclick: () => S.net.send({ t: 'kick', id: p.id }) }, 'Kick')))),
         h('h3', null, 'Your look'), cosmeticPicker(me),
         h('div', { class: 'renameRow' }, h('input', { id: 'renameIn', maxLength: 16, value: me?.name || '' }), h('button', { class: 'btn tiny', onclick: () => { const v = $('#renameIn').value.trim(); if (v && v !== me?.name) { S.net.send({ t: 'name', name: v }); settings.name = v; saveSettings(); } } }, 'Rename'))),
       h('div', { class: 'panel col' }, h('h3', null, 'Game Mode' + (host ? '' : '  (host chooses)')), h('div', { class: 'modes' }, modeCards),
         h('div', { class: 'setGrid' },
-          h('label', null, 'Map', sel('setMap', [['hayfield', 'Hayfield (large)'], ['barnyard', 'Barnyard (barns & bales)']], set.map, 'map', set.mode === 'golden')),
-          h('label', null, 'Round time', sel('setDur', [[60, '1 min'], [120, '2 min'], [180, '3 min'], [300, '5 min'], [480, '8 min'], [600, '10 min'], [900, '15 min']], set.duration, 'duration')),
-          h('label', null, 'Search difficulty', sel('setDiff', [['easy', 'Easy (1.6s)'], ['normal', 'Normal (2.4s)'], ['hard', 'Hard (3.4s)']], set.difficulty, 'difficulty')),
-          h('label', null, 'Metal detector', sel('setDet', [['off', 'Off'], ['weak', 'Weak'], ['normal', 'Normal'], ['strong', 'Strong']], set.detector, 'detector')),
-          h('label', null, 'Max players', sel('setMax', [2, 4, 6, 8, 10, 12].map(n => [n, n]), set.maxPlayers, 'maxPlayers')),
+          h('label', null, 'Round time', sel('setDur', [[60, '1 min'], [120, '2 min'], [180, '3 min'], [300, '5 min'], [480, '8 min'], [600, '10 min']], set.duration, 'duration')),
+          h('label', null, 'Sheep nerves', sel('setDiff', [['easy', 'Calm'], ['normal', 'Normal'], ['hard', 'Jumpy']], set.difficulty, 'difficulty')),
+          h('label', null, 'Flock size', sel('setFlock', [['small', 'Small'], ['normal', 'Normal'], ['large', 'Large']], set.flock, 'flock')),
+          h('label', null, 'Max dogs', sel('setMax', [2, 4, 6, 8, 10, 12].map(n => [n, n]), set.maxPlayers, 'maxPlayers')),
+          h('label', { class: 'chk' }, h('input', { type: 'checkbox', checked: set.storms || set.mode === 'stampede', disabled: !host || set.mode === 'stampede', onchange: e => S.net.send({ t: 'settings', storms: e.target.checked }) }), 'Thunderstorms'),
           h('label', { class: 'chk' }, h('input', { type: 'checkbox', checked: set.soloAllowed, disabled: !host, onchange: e => S.net.send({ t: 'settings', soloAllowed: e.target.checked }) }), 'Allow solo rounds'),
           h('label', { class: 'chk' }, h('input', { type: 'checkbox', checked: set.locked, disabled: !host, onchange: e => S.net.send({ t: 'lock', v: e.target.checked }) }), 'Lock room')),
-        h('div', { class: 'lobbyBtns' }, host ? h('button', { class: 'btn primary big', disabled: !canStart, onclick: () => S.net.send({ t: 'start' }) }, 'Start Match') : h('button', { class: 'btn primary big' + (me?.ready ? ' on' : ''), onclick: () => S.net.send({ t: 'ready', v: !me?.ready }) }, me?.ready ? '✓ Ready (click to cancel)' : 'Ready'), !host && h('small', null, 'Waiting for the host to start…')),
+        h('div', { class: 'lobbyBtns' }, host ? h('button', { class: 'btn primary big', onclick: () => S.net.send({ t: 'start' }) }, 'Start Match') : h('button', { class: 'btn primary big' + (me?.ready ? ' on' : ''), onclick: () => S.net.send({ t: 'ready', v: !me?.ready }) }, me?.ready ? '✓ Ready (click to cancel)' : 'Ready'), !host && h('small', null, 'Waiting for the host to start…')),
         h('div', { class: 'chatBox' }, chatLog, chatIn))));
   chatIn.addEventListener('keydown', e => { e.stopPropagation(); if (e.key === 'Enter') sendChat(); });
   renderChat(); if (prevChat != null) $('#chatLog').scrollTop = prevChat;
 }
 function cosmeticPicker(me) {
   if (!me) return h('div');
-  const needles = me.needles || 0, row = (kind, label) => h('label', { class: 'cosRow' }, label, h('select', { onchange: e => S.net.send({ t: 'cosmetic', [kind]: e.target.value }) }, COSMETICS[kind].map(([id, need]) => h('option', { value: id, selected: me.cosm[kind] === id, disabled: need > needles }, id + (need > needles ? ` 🔒 ${need} needle${need > 1 ? 's' : ''}` : '')))));
-  return h('div', { class: 'cos' }, h('div', { class: 'swatches' }, COSMETICS.color.map(c => h('button', { class: 'sw' + (me.cosm.color === c ? ' on' : ''), style: `background:${c}`, title: c, onclick: () => S.net.send({ t: 'cosmetic', color: c }) }))), row('hat', 'Hat'), row('jacket', 'Jacket'), row('gloves', 'Gloves'), row('boots', 'Boots'), row('skin', 'Detector'), row('victory', 'Victory'), h('small', null, 'Cosmetics unlock by finding needles during this room session. They never change gameplay.'));
+  const herded = me.herded || 0, row = (kind, label) => h('label', { class: 'cosRow' }, label, h('select', { onchange: e => S.net.send({ t: 'cosmetic', [kind]: e.target.value }) }, COSMETICS[kind].map(([id, need]) => h('option', { value: id, selected: me.cosm[kind] === id, disabled: need > herded }, id + (need > herded ? ` 🔒 ${need} sheep` : '')))));
+  return h('div', { class: 'cos' }, h('div', { class: 'swatches' }, COSMETICS.color.map(c => h('button', { class: 'sw' + (me.cosm.color === c ? ' on' : ''), style: `background:${c}`, title: c, onclick: () => S.net.send({ t: 'cosmetic', color: c }) }))), row('hat', 'Hat'), row('bandana', 'Bandana'), h('small', null, 'Hats and bandanas unlock by herding sheep during this room session. They never change gameplay. (Team modes use team colors.)'));
 }
 function renderChat() { const l = $('#chatLog'); if (!l) return; l.replaceChildren(...S.chat.map(c => h('div', { class: 'msg' }, h('b', null, c.name + ': '), c.text))); l.scrollTop = l.scrollHeight; }
 function sendChat() { const i = $('#chatIn'); if (!i) return; const t = i.value.trim(); if (t) S.net.send({ t: 'chat', text: t }); i.value = ''; }
@@ -508,42 +514,44 @@ function leaveRoom() { S.net?.send({ t: 'leave' }); sess.clear(); S.net?.close()
 // ----- game view
 function enterGame() {
   setScreen('game'); S.inGame = true; clearUI(); ui.append(hud || buildHud()); $('#hud').style.display = 'block'; ui.append($('#hud'));
-  updateHudStatic(); updateObjective(); updateDetHud(); updateScoreboard(); $('#game').style.display = 'block';
+  updateHudStatic(); updateObjective(); updateScoreboard(); $('#game').style.display = 'block';
   audio.startAmbience(); audio.setMusic(settings.musicInGame ? 'game' : 'off'); S.lastCd = 0;
   showStartPrompt();
 }
 function showStartPrompt() {
   $('#pause')?.remove(); if (document.pointerLockElement === canvas) return;
-  const p = h('div', { id: 'pause', class: 'modal dim' }, h('div', { class: 'panel modalBody' }, h('h2', null, S.phase === 'results' ? 'Round over' : 'Click to take control'), h('p', null, 'WASD move • Shift sprint • Space jump • E search/pick up • Q detector • Click scatter hay • Tab scoreboard • Esc pause'), h('button', { class: 'btn primary big', onclick: () => { p.remove(); requestLock(); } }, 'Enter the field'), h('div', { class: 'btnRow' }, h('button', { class: 'btn ghost', onclick: () => { p.remove(); leaveRoom(); } }, S.practice ? 'Quit to menu' : 'Leave room'))));
+  const p = h('div', { id: 'pause', class: 'modal dim' }, h('div', { class: 'panel modalBody' }, h('h2', null, S.phase === 'results' ? 'Round over' : S.spectator ? 'Join the field' : 'Click to take control'),
+    h('p', null, 'WASD move • Mouse look • Click bark • Space dash • E howl • Shift sprint • Tab scoreboard • Esc pause'), h('button', { class: 'btn primary big', onclick: () => { p.remove(); requestLock(); } }, 'Into the field'), h('div', { class: 'btnRow' }, h('button', { class: 'btn ghost', onclick: () => { p.remove(); leaveRoom(); } }, S.practice ? 'Quit to menu' : 'Leave room'))));
   ui.append(p);
 }
 function showPause() {
   if ($('#pause')) return;
-  const p = h('div', { id: 'pause', class: 'modal dim' }, h('div', { class: 'panel modalBody' }, h('h2', null, 'Paused'), h('p', null, S.practice ? 'Practice round continues in the background.' : 'The round keeps running for everyone else.'),
-    h('div', { class: 'btnCol' }, h('button', { class: 'btn primary', onclick: () => { p.remove(); requestLock(); } }, 'Resume'), h('button', { class: 'btn', onclick: () => settingsScreen(true) }, 'Settings'), S.practice && h('button', { class: 'btn', onclick: () => { p.remove(); const d = S.practiceDiff; S.net?.close(); startPractice(d); } }, 'Restart round'), h('button', { class: 'btn danger', onclick: () => { p.remove(); leaveRoom(); } }, S.practice ? 'Quit to menu' : 'Leave room'))));
+  const p = h('div', { id: 'pause', class: 'modal dim' }, h('div', { class: 'panel modalBody' }, h('h2', null, 'Paused'), h('p', null, S.practice ? 'The round keeps running while you are paused.' : 'The round keeps running for everyone else.'),
+    h('div', { class: 'btnCol' }, h('button', { class: 'btn primary', onclick: () => { p.remove(); requestLock(); } }, 'Resume'), h('button', { class: 'btn', onclick: () => settingsScreen(true) }, 'Settings'), S.practice && h('button', { class: 'btn', onclick: () => { p.remove(); const o = S.practiceOpt; S.net?.close(); startPractice(o); } }, 'Restart round'), h('button', { class: 'btn danger', onclick: () => { p.remove(); leaveRoom(); } }, S.practice ? 'Quit to menu' : 'Leave room'))));
   ui.append(p);
 }
 function hidePause() { $('#pause')?.remove(); $('#settingsModal')?.remove(); }
-function leaveGameView() { S.inGame = false; releaseLock(); $('#game') && ($('#game').style.display = 'none'); view?.clearWorld(); view?.clearRemotes(); remotes.clear(); S.revealed.clear(); S.search = null; $('#pause')?.remove(); }
+function leaveGameView() { S.inGame = false; releaseLock(); $('#game') && ($('#game').style.display = 'none'); view?.clearField(); remotes.clear(); S.field = null; $('#pause')?.remove(); }
 
 // ----- results
 function showResults() {
   const r = S.results; if (!r) return; setScreen('results'); S.inGame = false; $('#hud') && ($('#hud').style.display = 'none');
   $('#pause')?.remove(); $('#settingsModal')?.remove();
   const mine = r.winners.includes(S.you); let title, sub;
-  if (r.reason === 'found') { if (r.winnerTeam != null) { title = (r.winnerTeam === 0 ? 'RED' : 'BLUE') + ' TEAM WINS'; sub = `${r.finderName} found the needle`; } else { title = r.mode === 'endless' ? 'TIME!' : (mine ? 'YOU FOUND IT!' : `${r.finderName} WINS`); sub = `${r.finderName} claimed the ${r.needles[0]?.golden ? 'golden ' : ''}needle`; } }
-  else if (r.mode === 'endless') { const w = r.standings.find(s => s.win); title = w ? `${w.name} WINS` : 'TIME!'; sub = w ? `${w.roundScore} points` : 'Nobody scored'; }
-  else if (r.mode === 'hideseek') { title = `${r.hiderName} OUTSMARTED EVERYONE`; sub = 'The needle was never found'; }
-  else { title = 'TIME\'S UP'; sub = 'Nobody found the needle'; }
+  if (r.solo) {
+    const penned = r.pens.reduce((a, p) => a + p[2], 0), val = r.pens.reduce((a, p) => a + p[1], 0), share = Math.round(val / Math.max(1, r.total) * 100);
+    title = mine ? 'FLOCK PENNED!' : share >= 60 ? 'NICE HERDING' : 'TIME\'S UP'; sub = mine ? `Every sheep in ${fmtTime(r.secs * 1000)}` : `${penned} sheep penned · ${share}% of the flock's value`;
+  } else if (r.mode === 'team') { title = r.winnerTeam == null ? 'DRAW' : TEAM_NAME[r.winnerTeam].toUpperCase() + ' WINS'; sub = `${r.teamScore[0]} – ${r.teamScore[1]}` + (r.reason === 'domination' ? ' · domination' : ''); }
+  else { const w = r.standings.find(s => s.win); title = w ? (mine ? 'YOU WIN!' : `${w.name.toUpperCase()} WINS`) : 'NOBODY PENNED A SHEEP'; sub = w ? `${w.roundScore} points in the pen` + (r.reason === 'domination' ? ' · dominated the field' : '') : 'Time ran out'; }
   clearUI(); ui.append(h('div', { class: 'results' }, h('div', { class: 'panel resCard' }, h('div', { class: 'resBadge ' + (mine ? 'win' : '') }, mine ? '★' : '●'), h('h1', null, title), h('p', { class: 'sub' }, sub),
-    h('table', { class: 'resTable' }, h('thead', null, h('tr', null, ['#', 'Player', 'Round', 'Total', 'Needles', 'Searches', 'Hit %', 'Dig time', 'W–L', 'Best streak'].map(x => h('th', null, x)))),
-      h('tbody', null, r.standings.map((s, i) => h('tr', { class: (s.id === S.you ? 'me ' : '') + (s.win ? 'winr' : '') }, h('td', null, i + 1), h('td', null, S.room?.players.find(p => p.id === s.id)?.cosm && h('span', { class: 'dot', style: `background:${S.room.players.find(p => p.id === s.id).cosm.color}` }), s.name, s.win ? ' 🏆' : '', s.team != null ? (s.team === 0 ? ' (Red)' : ' (Blue)') : ''), h('td', null, s.roundScore), h('td', null, s.score), h('td', null, s.needles), h('td', null, s.searches), h('td', null, s.searches ? Math.round(s.okSearches / s.searches * 100) + '%' : '-'), h('td', null, s.searchSecs + 's'), h('td', null, `${s.wins}–${s.losses}`), h('td', null, s.bestStreak))))),
+    h('table', { class: 'resTable' }, h('thead', null, h('tr', null, ['#', 'Dog', 'Pen pts', 'Penned', 'Steals', 'Barks', 'Dashes', 'Bumps', 'Total', 'W–L'].map(x => h('th', null, x)))),
+      h('tbody', null, r.standings.map((s, i) => h('tr', { class: (s.id === S.you ? 'me ' : '') + (s.win ? 'winr' : '') }, h('td', null, i + 1), h('td', null, h('span', { class: 'dot', style: `background:${s.team != null ? TEAM_COLOR[s.team] : (infoOf(s.id)?.cosm?.color || '#fff')}` }), s.name, s.win ? ' 🏆' : ''), h('td', null, s.roundScore), h('td', null, s.herded), h('td', null, s.steals), h('td', null, s.barks), h('td', null, s.dashes), h('td', null, s.bumps), h('td', null, s.score), h('td', null, `${s.wins}–${s.losses}`))))),
     h('div', { class: 'btnRow', id: 'resBtns' }), h('small', null, 'Stats and unlocks last for this room session only.'))));
   renderResultsButtons();
 }
 function renderResultsButtons() {
   const b = $('#resBtns'); if (!b || !S.room) return; const host = S.room.hostId === S.you;
-  b.replaceChildren(host ? h('button', { class: 'btn primary big', onclick: () => S.net.send({ t: 'start' }) }, S.practice ? 'Play Again' : 'Play Again (new arena)') : h('button', { class: 'btn big', disabled: true }, 'Waiting for host to start…'), !S.practice && host && h('button', { class: 'btn', onclick: () => S.net.send({ t: 'toLobby' }) }, 'Back to Lobby'), h('button', { class: 'btn ghost', onclick: leaveRoom }, S.practice ? 'Quit' : 'Leave Room'));
+  b.replaceChildren(host ? h('button', { class: 'btn primary big', onclick: () => S.practice ? (S.net.close(), startPractice(S.practiceOpt)) : S.net.send({ t: 'start' }) }, S.practice ? 'Play Again' : 'Play Again (new field)') : h('button', { class: 'btn big', disabled: true }, 'Waiting for host to start…'), !S.practice && host && h('button', { class: 'btn', onclick: () => S.net.send({ t: 'toLobby' }) }, 'Back to Lobby'), h('button', { class: 'btn ghost', onclick: leaveRoom }, S.practice ? 'Quit' : 'Leave Room'));
 }
 
 // ----- settings & how-to
@@ -553,17 +561,17 @@ function settingsScreen(inGame) {
   const check = (key, label) => h('label', { class: 'srow chk' }, h('input', { type: 'checkbox', checked: settings[key], onchange: e => { settings[key] = e.target.checked; saveSettings(); applySettings(); } }), label);
   const m = h('div', { id: 'settingsModal', class: 'modal dim' }, h('div', { class: 'panel modalBody wide' }, h('h2', null, 'Settings'),
     h('div', { class: 'sgrid' },
-      h('div', null, h('h4', null, 'Controls'), slider('sens', 'Mouse sensitivity', 0.2, 3, 0.05, v => v.toFixed(2) + '×'), check('bob', 'Head bob'), check('reduceMotion', 'Reduced camera movement'), check('reduceFlash', 'Reduced flashing')),
+      h('div', null, h('h4', null, 'Controls'), slider('sens', 'Mouse sensitivity', 0.2, 3, 0.05, v => v.toFixed(2) + '×'), check('reduceMotion', 'Reduced camera shake'), check('reduceFlash', 'Reduced flashing (lightning, hits)')),
       h('div', null, h('h4', null, 'Audio'), slider('master', 'Master volume', 0, 1, 0.05, v => Math.round(v * 100) + '%'), slider('music', 'Music volume', 0, 1, 0.05, v => Math.round(v * 100) + '%'), slider('sfx', 'Effects volume', 0, 1, 0.05, v => Math.round(v * 100) + '%'), check('musicInGame', 'Music during matches')),
       h('div', null, h('h4', null, 'Display'), slider('uiScale', 'UI scale', 0.8, 1.5, 0.05, v => Math.round(v * 100) + '%'), h('label', { class: 'srow' }, 'Graphics quality', h('select', { onchange: e => { settings.quality = e.target.value; saveSettings(); applySettings(); } }, [['low', 'Low (best FPS)'], ['medium', 'Medium'], ['high', 'High (shadows)']].map(([v, l]) => h('option', { value: v, selected: settings.quality === v }, l))), h('span')))),
     h('div', { class: 'btnRow' }, h('button', { class: 'btn primary', onclick: () => { m.remove(); } }, 'Done'))));
-  (inGame ? ui : document.body).append(m); if (!inGame) document.body.append(m);
+  (inGame ? ui : document.body).append(m);
 }
 function howTo() {
   const m = h('div', { class: 'modal dim' }, h('div', { class: 'panel modalBody wide' }, h('h2', null, 'How to Play'),
-    h('p', null, 'A needle is hidden somewhere in a gigantic field of hay. Search the piles, dodge the decoys, and claim the needle before anyone else.'),
-    h('div', { class: 'sgrid' }, h('div', null, h('h4', null, 'Controls'), h('ul', null, h('li', null, h('kbd', null, 'W A S D'), ' move'), h('li', null, h('kbd', null, 'Mouse'), ' look'), h('li', null, h('kbd', null, 'Shift'), ' sprint (uses stamina)'), h('li', null, h('kbd', null, 'Space'), ' jump'), h('li', null, h('kbd', null, 'E'), ' search hay / pick up the needle'), h('li', null, h('kbd', null, 'Click'), ' scatter hay'), h('li', null, h('kbd', null, 'Q'), ' metal detector'), h('li', null, h('kbd', null, 'Tab'), ' scoreboard'), h('li', null, h('kbd', null, 'Esc'), ' pause'))),
-      h('div', null, h('h4', null, 'Searching'), h('p', null, 'Stand in hay and press E. Stay put until the bar fills; walking away cancels it. A search digs up whatever is within arm\'s reach: decoys (nails, coins, tools — small bonus points), or the needle. Then press E again to grab the needle.'), h('h4', null, 'Metal detector'), h('p', null, 'Beeps faster as you near metal — the needle or metal decoys. It never points the way. The battery drains while it\'s on.'))),
+    h('p', null, 'You are a sheepdog. A flock of sheep is loose in the field, and every dog has a pen. Sheep run away from dogs, so work your way around behind them and push them into YOUR pen. Whoever has the most sheep in their pen when time runs out wins — and rival dogs can steal sheep out of yours.'),
+    h('div', { class: 'sgrid' }, h('div', null, h('h4', null, 'Controls'), h('ul', null, h('li', null, h('kbd', null, 'W A S D'), ' run (relative to the camera)'), h('li', null, h('kbd', null, 'Mouse'), ' turn the camera'), h('li', null, h('kbd', null, 'Click'), ' / ', h('kbd', null, 'F'), ' bark — startles sheep in front of you'), h('li', null, h('kbd', null, 'Space'), ' dash — barge through the flock and stun rival dogs'), h('li', null, h('kbd', null, 'E'), ' howl — a huge shout that scatters every sheep near you'), h('li', null, h('kbd', null, 'Shift'), ' sprint (uses stamina)'), h('li', null, h('kbd', null, 'Tab'), ' scoreboard'), h('li', null, h('kbd', null, 'Esc'), ' pause'))),
+      h('div', null, h('h4', null, 'The flock'), h('p', null, 'White sheep are worth 1. Black sheep are worth 2 but sprint faster. The golden sheep in the middle is worth 5 and is skittish. Sheep avoid you from about 8 metres away; sprinting makes them spook earlier. Mud slows everything down.'), h('h4', null, 'Winning'), h('p', null, 'Hold 60% of the flock\'s value for 8 seconds and you win on the spot, so keep an eye on the leader. Thunderstorms make every loose sheep bolt, which resets the race.'))),
     h('h4', null, 'Modes'), h('ul', { class: 'modesList' }, Object.values(MODES).map(v => h('li', null, h('b', null, v.label + ': '), v.desc))),
     h('div', { class: 'btnRow' }, h('button', { class: 'btn primary', onclick: () => m.remove() }, 'Got it'))));
   document.body.append(m);
@@ -582,7 +590,7 @@ async function boot() {
   if (m) inviteJoin(m[1].toUpperCase(), saved && saved.code === m[1].toUpperCase() ? saved.token : undefined);
   else if (saved) { busy('Rejoining your room…'); try { S.net = new OnlineNet(); await S.net.open({ t: 'join', code: saved.code, token: saved.token, name: settings.name }); unbusy(); } catch { unbusy(); sess.clear(); goMenu(); } }
   else goMenu();
-  window.__needle = { S, L, W, settings, remotes }; // handy for debugging in the console
+  window.__flock = { S, L, settings, remotes, keys }; // handy for debugging in the console
 }
 function inviteJoin(code, token) {
   setScreen('menu'); clearUI(); audio.setMusic('menu');

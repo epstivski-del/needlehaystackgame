@@ -42,7 +42,7 @@ async function getJSON(p) { const r = await fetch(base + p); return { status: r.
 
 await test('HTTP: health endpoint, game page, invite-link route, traversal protection', async () => {
   const h = await getJSON('/health'); assert.equal(h.status, 200); assert.equal(JSON.parse(h.body).ok, true);
-  const idx = await getJSON('/'); assert.equal(idx.status, 200); assert.match(idx.type, /html/); assert.match(idx.body, /NEEDLE/i);
+  const idx = await getJSON('/'); assert.equal(idx.status, 200); assert.match(idx.type, /html/); assert.match(idx.body, /FLOCK RUSH/i);
   const inv = await getJSON('/r/ABCDE'); assert.equal(inv.status, 200); assert.equal(inv.body, idx.body);
   assert.equal((await getJSON('/shared/engine.js')).status, 200);
   const trav = await getJSON('/..%2fserver%2findex.js'); assert.ok([403, 404].includes(trav.status)); assert.ok(!trav.body.includes('createServer'));
@@ -76,7 +76,7 @@ await test('two independent sessions: create private room, friend joins via the 
   const room = await host.waitFor(m => m.t === 'room' && m.players.length === 2, 3000, 'room with 2 players');
   assert.deepEqual(room.players.map(p => p.name).sort(), ['Alice', 'Bob']); assert.equal(room.hostId, host.you);
   const gr = await guest.waitFor(m => m.t === 'room' && m.players.length === 2); assert.equal(gr.code, code);
-  host.send({ t: 'settings', mode: 'classic', duration: 6, difficulty: 'easy' });
+  host.send({ t: 'settings', mode: 'ffa', duration: 6, difficulty: 'easy', storms: false });
   await host.waitFor(m => m.t === 'room' && m.settings.duration === 6 && m.settings.difficulty === 'easy');
 });
 
@@ -86,65 +86,62 @@ await test('lobby: guest cannot start; host must wait for ready, then start', as
   guest.send({ t: 'ready', v: true }); await host.waitFor(m => m.t === 'room' && m.players.find(p => p.id === guest.you)?.ready);
 });
 
-await test('match starts: both clients get the same shared arena seed and round state', async () => {
+await test('match starts: both clients get the same shared field seed, their own pens, and the same sheep count', async () => {
   host.send({ t: 'start' });
   const [a, b] = await Promise.all([host.waitFor('round'), guest.waitFor('round')]);
-  assert.equal(a.seed, b.seed); assert.equal(a.map, b.map); assert.equal(a.mode, 'classic'); assert.equal(a.phase, 'countdown');
-  assert.ok(a.you.spawn && b.you.spawn && (a.you.spawn.x !== b.you.spawn.x || a.you.spawn.z !== b.you.spawn.z));
-  assert.ok(!JSON.stringify([a, b]).includes('needle')); round1 = a;
+  assert.equal(a.seed, b.seed); assert.equal(a.mode, 'ffa'); assert.equal(a.phase, 'countdown'); assert.deepEqual(a.field, b.field);
+  assert.ok(a.you.slot >= 0 && b.you.slot >= 0 && a.you.slot !== b.you.slot, 'different pens');
+  assert.ok(a.you.spawn && b.you.spawn && (a.you.spawn.x !== b.you.spawn.x || a.you.spawn.z !== b.you.spawn.z)); round1 = a;
   const pa = await host.waitFor(m => m.t === 'phase' && m.phase === 'playing', 5000, 'playing'); assert.ok(pa.remainingMs <= 6000);
   await guest.waitFor(m => m.t === 'phase' && m.phase === 'playing');
 });
 
-await test('movement is synchronised: each player sees the other in the shared world', async () => {
+await test('the flock is streamed to both clients, and both see the same positions', async () => {
+  const [sa, sb] = await Promise.all([host.fresh('sheep'), guest.fresh('sheep')]);
+  assert.equal(sa.s.length, a_len(round1) * 4); assert.equal(sb.s.length, sa.s.length);
+});
+function a_len(r) { return r.field.sheep; }
+
+await test('movement is synchronised: each player sees the other dog in the shared field', async () => {
   const room = hub.rooms.get(code), A = room.players.get(host.you);
-  const sx = A.pos.x, sz = A.pos.z;
-  for (let i = 1; i <= 6; i++) { host.send({ t: 'pos', x: sx + i * 0.3, y: 0, z: sz, yaw: 1.25, pitch: 0.1, f: 1 }); await sleep(70); }
-  const snap = await guest.waitFor(m => m.t === 'snap' && m.p.some(r => r[0] === host.you && r[1] > sx + 1.75), 3000, 'snap with host moved');
-  const row = snap.p.find(r => r[0] === host.you); assert.ok(Math.abs(row[1] - (sx + 1.8)) < 0.05, 'x ' + row[1]); assert.equal(row[4], 1.25); assert.equal(row[6] & 1, 1);
-  guest.send({ t: 'pos', x: room.players.get(guest.you).pos.x + 0.4, y: 0, z: room.players.get(guest.you).pos.z, yaw: 2, pitch: 0, f: 0 });
-  await host.waitFor(m => m.t === 'snap' && m.p.some(r => r[0] === guest.you && r[4] === 2), 3000, 'snap with guest');
+  const sx = A.pos.x, sz = A.pos.z, dir = A.pos.z > 0 ? -1 : 1;
+  for (let i = 1; i <= 6; i++) { host.send({ t: 'pos', x: sx, z: sz + dir * i * 0.3, yaw: 1.25, f: 1 }); await sleep(70); }
+  const snap = await guest.waitFor(m => m.t === 'snap' && m.p.some(r => r[0] === host.you && Math.abs(r[2] - (sz + dir * 1.8)) < 0.06), 3000, 'snap with host moved');
+  const row = snap.p.find(r => r[0] === host.you); assert.equal(row[3], 1.25); assert.equal(row[4] & 1, 1);
+  const B = room.players.get(guest.you); guest.send({ t: 'pos', x: B.pos.x + 0.4, z: B.pos.z, yaw: 2, f: 0 });
+  await host.waitFor(m => m.t === 'snap' && m.p.some(r => r[0] === guest.you && r[3] === 2), 3000, 'snap with guest');
 });
 
-await test('search is synchronised and server-validated; claiming without uncovering is refused', async () => {
-  const room = hub.rooms.get(code), n = room.round.needles[0], A = room.players.get(host.you), B = room.players.get(guest.you);
-  guest.send({ t: 'pickup', id: n.id }); assert.equal((await guest.waitFor('pickup_fail')).why, 'hidden');
-  // white-box: stand both players beside the hidden needle (inside hay)
-  for (const [P, off] of [[A, 0.8], [B, -0.8]]) { P.pos.x = n.x + off; P.pos.z = n.z; P.pos.t = Date.now(); }
-  host.send({ t: 'search_start' }); const st = await host.waitFor('search_started'); assert.ok(st.ms >= 1000);
-  const ev = await guest.waitFor(m => m.t === 'ev' && m.k === 'search_start' && m.id === host.you, 2000, 'guest sees host searching');
-  host.send({ t: 'search_finish' }); assert.equal((await host.waitFor('search_denied')).why, 'early');
-  await sleep(st.ms + 120); host.send({ t: 'search_finish' });
-  const res = await host.waitFor('search_result'); assert.ok(['decoy', 'needle', 'nothing'].includes(res.result));
-  await guest.waitFor(m => m.t === 'ev' && m.k === 'search_stop' && m.id === host.you);
+await test('bark is validated by the server and visible to both dogs; sheep react', async () => {
+  const room = hub.rooms.get(code), A = room.players.get(host.you), sim = room.round.sim;
+  const s = sim.sheep[0]; const fwd = [-Math.sin(A.pos.yaw), -Math.cos(A.pos.yaw)]; s.x = A.pos.x + fwd[0] * 5; s.z = A.pos.z + fwd[1] * 5; s.vx = s.vz = 0;
+  host.send({ t: 'bark' }); await guest.waitFor(m => m.t === 'ev' && m.k === 'bark' && m.id === host.you, 2000, 'bark event');
+  assert.ok(Math.hypot(s.vx, s.vz) > 2, 'sheep startled'); assert.equal(A.stats.barks, 1);
+  host.send({ t: 'bark' }); await sleep(100); assert.equal(A.stats.barks, 1, 'cooldown holds over the wire');
 });
 
-await test('first valid needle pickup wins; both clients receive the same winner and scores', async () => {
-  const room = hub.rooms.get(code), n = room.round.needles[0], A = room.players.get(host.you), B = room.players.get(guest.you);
-  // uncover the needle through the real search flow (repeat until the 2.8m reach contains it)
-  for (let i = 0; i < 4 && !A.exposed.has(n.id); i++) { A.pos.x = n.x + 0.5; A.pos.z = n.z; A.pos.t = Date.now(); host.send({ t: 'search_start' }); const s = await host.fresh('search_started'); await sleep(s.ms + 100); host.send({ t: 'search_finish' }); await host.fresh('search_result'); }
-  assert.ok(A.exposed.has(n.id), 'needle was not uncovered by searching'); const rv = await host.waitFor('reveal'); assert.equal(rv.kind, 'needle');
-  assert.ok(!guest.msgs.some(m => m.t === 'reveal'), 'needle position leaked to the other player');
-  B.exposed.add(n.id); B.pos.x = n.x + 1; B.pos.z = n.z; B.pos.t = Date.now(); A.pos.x = n.x + 1; A.pos.z = n.z; A.pos.t = Date.now();
-  host.send({ t: 'pickup', id: n.id }); guest.send({ t: 'pickup', id: n.id }); // simultaneous attempts
-  const [ra, rb] = await Promise.all([host.waitFor('results'), guest.waitFor('results')]);
-  assert.deepEqual(ra.winners, rb.winners); assert.equal(ra.winners.length, 1); assert.equal(ra.reason, 'found');
-  const winnerId = ra.winners[0]; assert.equal(ra.finderName, winnerId === host.you ? 'Alice' : 'Bob');
-  assert.deepEqual(ra.standings.map(s => [s.id, s.roundScore]), rb.standings.map(s => [s.id, s.roundScore]));
-  assert.ok(ra.standings.find(s => s.id === winnerId).roundScore >= 100);
-  const loser = winnerId === host.you ? guest : host; assert.ok(ra.standings.find(s => s.id === loser.you).roundScore < 100 || true);
-  assert.equal(ra.standings.filter(s => s.win).length, 1);
+await test('penning a sheep is announced to everyone and scores match on both clients', async () => {
+  const room = hub.rooms.get(code), A = room.players.get(host.you), sim = room.round.sim, pen = room.round.field.pens[A.slot];
+  const s = sim.sheep[3]; s.x = pen.cx; s.z = pen.cz; s.vx = s.vz = 0; s.lastPush = A.id; s.lastPushT = sim.time;
+  const ev = await guest.waitFor(m => m.t === 'ev' && m.k === 'penned' && m.sheep === 3, 3000, 'penned event'); assert.equal(ev.by, host.you); assert.equal(ev.slot, A.slot);
+  const ok = m => m.t === 'scores' && m.pens.find(p => p[0] === A.slot)[1] >= s.value;
+  const [ha, ga] = await Promise.all([host.waitFor(ok, 3000, 'host scores'), guest.waitFor(ok, 3000, 'guest scores')]);
+  assert.deepEqual(ha.pens.map(p => p[0]), ga.pens.map(p => p[0]));
 });
 
-await test('another round starts in the same room without reconnecting; new arena seed', async () => {
+await test('round timer expiry is decided by the server; both clients get the same results', async () => {
+  const [ra, rb] = await Promise.all([host.fresh('results', 12000), guest.fresh('results', 12000)]);
+  assert.equal(ra.reason, 'timeout'); assert.deepEqual(ra.winners, rb.winners); assert.equal(ra.winners.length, 1, 'whoever has the most sheep penned wins'); assert.equal(ra.winners[0], host.you);
+  assert.deepEqual(ra.standings.map(x => [x.id, x.roundScore]), rb.standings.map(x => [x.id, x.roundScore])); assert.ok(ra.standings[0].roundScore >= 1);
+});
+
+await test('another round starts in the same room without reconnecting; new field seed', async () => {
+  host.send({ t: 'toLobby' }); await host.waitFor('lobby'); guest.send({ t: 'ready', v: true });
+  await host.waitFor(m => m.t === 'room' && m.phase === 'lobby' && m.players.find(p => p.id === guest.you)?.ready, 3000, 'ready again');
   host.send({ t: 'start' });
   const r2 = await host.fresh('round'); const g2 = await guest.fresh('round');
   assert.equal(r2.seed, g2.seed); assert.notEqual(r2.seed, round1.seed); assert.equal(hub.rooms.get(code).roundCount, 2);
-});
-
-await test('round timer expiry is decided by the server and both clients get a timeout result', async () => {
-  const [ra, rb] = await Promise.all([host.fresh('results', 12000), guest.fresh('results', 12000)]);
-  assert.equal(ra.reason, 'timeout'); assert.deepEqual(ra.winners, []); assert.equal(rb.reason, 'timeout'); assert.equal(ra.needles.length, 1);
+  await host.fresh('results', 12000);
 });
 
 await test('reconnect: dropped player rejoins with the stored token and keeps their identity and score', async () => {
@@ -177,7 +174,7 @@ await test('oversized frames drop the connection; message floods are throttled',
 });
 
 await test('solo practice-style room works over the wire and a locked room refuses newcomers', async () => {
-  const s = await new Client('solo').connect(); s.send({ t: 'create', name: 'Solo', practice: true }); const r = await s.waitFor('round'); assert.equal(r.mode, 'classic');
+  const s = await new Client('solo').connect(); s.send({ t: 'create', name: 'Solo', practice: true }); const r = await s.waitFor('round'); assert.equal(r.mode, 'ffa');
   const intruder = await new Client('in').connect(); intruder.send({ t: 'join', code: s.code, name: 'Z' }); assert.equal((await intruder.waitFor('err')).code, 'FULL');
   guest.send({ t: 'lock', v: true }); await guest.waitFor(m => m.t === 'room' && m.settings.locked);
   const late = await new Client('late').connect(); late.send({ t: 'join', code, name: 'Late' }); assert.equal((await late.waitFor('err')).code, 'LOCKED');

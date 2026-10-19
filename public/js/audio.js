@@ -71,6 +71,18 @@ export const audio = {
   join() { tone(587, 0.1, { type: 'sine', gain: 0.1 }); tone(784, 0.15, { type: 'sine', gain: 0.1, t0: 0.08 }); }, leave() { tone(500, 0.12, { type: 'sine', gain: 0.1, freq2: 350 }); },
   click() { tone(520, 0.05, { type: 'triangle', gain: 0.1, freq2: 640 }); }, hover() { if (throttle('hov', 60)) tone(800, 0.025, { type: 'sine', gain: 0.03 }); },
   error() { tone(200, 0.2, { type: 'sawtooth', gain: 0.08, freq2: 140 }); },
+  // ---- FLOCK RUSH ----
+  bark(rel) { const sp = rel ? spatial(rel.dx, rel.dz, rel.yaw) : { gain: 1, pan: 0 }; if (sp.gain < 0.04 || (rel && !throttle('bk' + rel.id, 150))) return; tone(520, 0.09, { type: 'sawtooth', gain: 0.22 * sp.gain, freq2: 300, pan: sp.pan }); noise(0.1, { f: 1400, q: 1.2, gain: 0.16 * sp.gain, pan: sp.pan }); tone(420, 0.12, { type: 'square', gain: 0.1 * sp.gain, freq2: 250, t0: 0.09, pan: sp.pan }); },
+  howl(rel) { const sp = rel ? spatial(rel.dx, rel.dz, rel.yaw) : { gain: 1, pan: 0 }; if (sp.gain < 0.04) return; tone(380, 1.3, { type: 'sine', gain: 0.22 * sp.gain, freq2: 760, attack: 0.25, pan: sp.pan }); tone(384, 1.3, { type: 'triangle', gain: 0.1 * sp.gain, freq2: 770, attack: 0.3, pan: sp.pan }); },
+  dash(rel) { const sp = rel ? spatial(rel.dx, rel.dz, rel.yaw) : { gain: 1, pan: 0 }; if (sp.gain < 0.04) return; noise(0.3, { f: 600, f2: 2600, q: 0.7, gain: 0.3 * sp.gain, pan: sp.pan }); },
+  bump(rel) { const sp = rel ? spatial(rel.dx, rel.dz, rel.yaw) : { gain: 1, pan: 0 }; tone(120, 0.18, { type: 'sine', gain: 0.4 * sp.gain, freq2: 55, pan: sp.pan }); noise(0.1, { type: 'lowpass', f: 600, gain: 0.3 * sp.gain, pan: sp.pan }); },
+  baa(rel) { const sp = rel ? spatial(rel.dx, rel.dz, rel.yaw) : { gain: 1, pan: 0 }; if (sp.gain < 0.05 || !throttle('baa', 260)) return; const f = 300 + Math.random() * 120; tone(f, 0.38, { type: 'sawtooth', gain: 0.07 * sp.gain, freq2: f * 0.8, attack: 0.04, pan: sp.pan }); tone(f * 2, 0.3, { type: 'square', gain: 0.025 * sp.gain, freq2: f * 1.5, pan: sp.pan }); },
+  penned(value) { const n = value >= 5 ? [659, 784, 988, 1319] : value >= 2 ? [587, 740, 988] : [523, 784]; n.forEach((f, i) => tone(f, 0.28, { type: 'triangle', gain: 0.16, t0: i * 0.07 })); },
+  stolen(mine) { if (mine) { tone(440, 0.12, { type: 'square', gain: 0.1, freq2: 880 }); tone(880, 0.25, { type: 'triangle', gain: 0.16, t0: 0.1 }); } else { tone(300, 0.3, { type: 'sawtooth', gain: 0.12, freq2: 150 }); } },
+  thunderWarn() { noise(1.2, { type: 'lowpass', f: 300, gain: 0.25, attack: 0.5 }); tone(60, 1.4, { type: 'sine', gain: 0.18, attack: 0.6 }); },
+  thunder() { noise(2.2, { type: 'lowpass', f: 900, f2: 120, gain: 0.7, attack: 0.01 }); tone(48, 1.6, { type: 'sine', gain: 0.5, freq2: 30 }); noise(0.15, { f: 3500, q: 0.5, gain: 0.5 }); },
+  dominating() { [220, 233, 220, 233].forEach((f, i) => tone(f, 0.18, { type: 'square', gain: 0.07, t0: i * 0.2 })); },
+  cooldownReady() { tone(900, 0.04, { type: 'sine', gain: 0.05 }); },
   otherSearch(rel) { this.rustle(rel); },
 
   // wind + barn creaks + crickets

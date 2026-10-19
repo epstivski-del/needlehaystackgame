@@ -1,4 +1,4 @@
-// NEEDLE IN A HAYSTACK — production server: static files + /health + /ws (authoritative multiplayer).
+// FLOCK RUSH — production server: static files + /health + /ws (authoritative multiplayer).
 // Zero npm dependencies. Railway terminates TLS, so browsers connect over https:// and wss:// automatically.
 import http from 'node:http';
 import { readFile, stat } from 'node:fs/promises';
@@ -73,7 +73,7 @@ export function createServer(opts = {}) {
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   const port = Number(process.env.PORT || 3000);
   const { server } = createServer();
-  server.listen(port, '0.0.0.0', () => console.log(`Needle in a Haystack listening on :${port}`));
+  server.listen(port, '0.0.0.0', () => console.log(`Flock Rush listening on :${port}`));
   const stop = () => { console.log('Shutting down'); server.close(() => process.exit(0)); setTimeout(() => process.exit(0), 3000).unref(); };
   process.on('SIGTERM', stop); process.on('SIGINT', stop);
 }

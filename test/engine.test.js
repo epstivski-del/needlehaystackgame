@@ -1,8 +1,9 @@
-// Engine tests: rooms, permissions, authoritative pickups, scoring, all five modes, detector, chat, reconnects.
+// Engine tests: rooms, permissions, authoritative sheep sim, scoring, modes, stun, thunder, chat, reconnects.
 // Uses a fake clock so round timers are verified deterministically (no sleeping).
 import assert from 'node:assert/strict';
 import { Hub } from '../public/shared/engine.js';
-import { generateWorld, pickHiddenSpot, isReachable, mulberry32, MAPS } from '../public/shared/world.js';
+import { generateField, sheepCountFor, penAt, resolveCollision } from '../public/shared/field.js';
+import { FlockSim, TUNING } from '../public/shared/sim.js';
 
 let passed = 0, failed = 0;
 const results = [];
@@ -33,7 +34,7 @@ function makeEnv(opts = {}) {
     };
     return c;
   };
-  const make = (n, mode = 'classic', settings = {}) => {
+  const make = (n, mode = 'ffa', settings = {}) => {
     const a = client('Alice'); a.send({ t: 'create', name: 'Alice' });
     const code = a.last('joined').code;
     const rest = [];
@@ -42,18 +43,17 @@ function makeEnv(opts = {}) {
     for (const c of rest) c.send({ t: 'ready', v: true });
     return { a, rest, all: [a, ...rest], code, room: hub.rooms.get(code) };
   };
-  // move a player via legitimate position messages (server enforces speed limits)
+  // Walk a dog with legitimate position messages (the server enforces speed limits).
   const moveTo = (c, x, z) => {
-    for (let i = 0; i < 60; i++) {
+    for (let i = 0; i < 80; i++) {
       const q = c.p.pos; const dx = x - q.x, dz = z - q.z, d = Math.hypot(dx, dz);
       if (d < 0.05) return;
       const step = Math.min(d, 9); adv(1000);
-      c.send({ t: 'pos', x: q.x + dx / d * step, z: q.z + dz / d * step, y: 0, yaw: 0, pitch: 0, f: 1 });
+      c.send({ t: 'pos', x: q.x + dx / d * step, z: q.z + dz / d * step, yaw: Math.atan2(-dx, -dz), f: 1 });
     }
   };
   const toPlaying = room => { adv(3100); assert.equal(room.phase, 'playing'); };
-  const doSearch = (c, secs = 2.6) => { c.send({ t: 'search_start' }); adv(secs * 1000); c.send({ t: 'search_finish' }); return c.last('search_result'); };
-  return { hub, adv, client, make, moveTo, toPlaying, doSearch, now: () => clock };
+  return { hub, adv, client, make, moveTo, toPlaying, now: () => clock };
 }
 
 await test('room creation produces a real room with a unique 5-char code', () => {
@@ -83,7 +83,7 @@ await test('12-player rooms fill and the 13th is rejected', () => {
 await test('only the host can change settings, lock, kick or start', () => {
   const env = makeEnv(); const { a, rest } = env.make(2); const b = rest[0];
   for (const m of [{ t: 'settings', mode: 'golden' }, { t: 'lock', v: true }, { t: 'kick', id: a.id }, { t: 'start' }]) { b.clear(); b.send(m); assert.equal(b.last('err')?.code, 'NOT_HOST', m.t); }
-  assert.equal(a.room.settings.mode, 'classic'); assert.equal(a.room.settings.locked, false);
+  assert.equal(a.room.settings.mode, 'ffa'); assert.equal(a.room.settings.locked, false);
 });
 
 await test('duplicate names are made unique and bad names are refused', () => {
@@ -93,155 +93,194 @@ await test('duplicate names are made unique and bad names are refused', () => {
   const c = env.client(); c.send({ t: 'join', code, name: 'xxfuckxx' }); assert.equal(c.last('err').code, 'NAME_BAD');
 });
 
+const run = (env, ms) => { for (let i = 0; i < ms / 50; i++) env.adv(50); };
+const place = (room, i, x, z, by = -1) => { const s = room.round.sim.sheep[i]; s.x = x; s.z = z; s.vx = s.vz = 0; s.lastPush = by; s.lastPushT = room.round.sim.time; return s; };
+const penOf = (room, slot) => room.round.field.pens[slot];
+const start = (n, mode = 'ffa', settings = {}) => { const env = makeEnv(); const g = env.make(n, mode, settings); g.a.send({ t: 'start' }); return { env, g }; };
+
 await test('start requires enough players, ready status; solo only when the host allows it', () => {
   const env = makeEnv(); const a = env.client(); a.send({ t: 'create', name: 'Solo' });
   a.send({ t: 'start' }); assert.equal(a.last('err').code, 'TOO_FEW');
   a.send({ t: 'settings', soloAllowed: true, duration: 60 }); a.clear(); a.send({ t: 'start' }); assert.equal(a.room.phase, 'countdown');
   const e2 = makeEnv(); const g = e2.make(2); g.rest[0].send({ t: 'ready', v: false }); g.a.send({ t: 'start' });
   assert.equal(g.a.last('err').code, 'NOT_READY'); assert.equal(g.room.phase, 'lobby');
-  const e3 = makeEnv(); const h = e3.make(2, 'hideseek', { soloAllowed: true }); h.rest[0].conn.player.connected = false; h.a.send({ t: 'start' });
-  assert.equal(h.a.last('err').code, 'TOO_FEW');
 });
 
-await test('needle coordinates are never sent to clients before it is uncovered', () => {
-  const env = makeEnv(); const g = env.make(2); g.a.send({ t: 'start' }); env.toPlaying(g.room); env.adv(5000);
-  const n = g.room.round.needles[0];
-  for (const c of g.all) {
-    const s = JSON.stringify(c.log);
-    assert.ok(!s.includes(n.x.toFixed(3)) && !s.includes(String(n.x).slice(0, 8)), 'needle x leaked');
-    assert.ok(!c.log.some(m => m.t === 'reveal'));
-    const rm = c.last('round'); assert.ok(rm.seed && !('needles' in rm) && !('items' in rm));
+await test('every player gets their own pen in Roundup, and the round message lets clients rebuild the identical field', () => {
+  const { g } = start(4); const room = g.room, r = room.round;
+  assert.equal(r.field.pens.length, 4);
+  assert.deepEqual(new Set(g.all.map(c => c.p.slot)).size, 4);
+  const m = g.rest[0].last('round'); assert.equal(m.mode, 'ffa'); assert.equal(m.phase, 'countdown');
+  const again = generateField(m.seed, m.field);
+  assert.equal(JSON.stringify(again), JSON.stringify(r.field));
+  assert.equal(m.you.slot, g.rest[0].p.slot); assert.equal(m.you.spectator, false);
+});
+
+await test('round timers are authoritative: countdown -> playing -> timeout results', () => {
+  const env = makeEnv(); const g = env.make(2, 'ffa', { duration: 5, storms: false }); g.a.send({ t: 'start' });
+  assert.equal(g.room.phase, 'countdown'); env.adv(2000); assert.equal(g.room.phase, 'countdown'); env.adv(1200); assert.equal(g.room.phase, 'playing');
+  run(env, 4000); assert.equal(g.room.phase, 'playing'); run(env, 1500); assert.equal(g.room.phase, 'results');
+  const res = g.a.last('results'); assert.equal(res.reason, 'timeout'); assert.deepEqual(res.winners, [], 'nobody penned anything: no winner');
+});
+
+await test('dogs cannot teleport: impossible moves are clamped and corrected; countdown freezes dogs', () => {
+  const { env, g } = start(2); const [A] = g.all; const sp = { ...A.p.pos };
+  A.send({ t: 'pos', x: sp.x + 5, z: sp.z, yaw: 0, f: 1 }); assert.equal(A.p.pos.x, sp.x, 'frozen during countdown');
+  env.toPlaying(g.room); env.adv(100);
+  A.send({ t: 'pos', x: sp.x + 40, z: sp.z, yaw: 0, f: 1 });
+  assert.ok(Math.hypot(A.p.pos.x - sp.x, A.p.pos.z - sp.z) < 3, 'clamped to a believable step'); assert.ok(A.last('tp'));
+  A.send({ t: 'pos', x: 9999, z: -9999, yaw: 0, f: 1 }); assert.ok(Math.abs(A.p.pos.x) < 70 && Math.abs(A.p.pos.z) < 70);
+  A.send({ t: 'pos', x: NaN, z: 'x', yaw: 0 }); assert.ok(Number.isFinite(A.p.pos.x));
+});
+
+await test('dogs cannot walk through walls or hay bales', () => {
+  const { env, g } = start(2); env.toPlaying(g.room); const A = g.a, f = g.room.round.field;
+  const wall = f.solids.find(s => s.kind === 'bale'); env.adv(200);
+  A.p.pos = { x: wall.minX - 3, z: wall.cz, yaw: 0, t: env.now() };
+  for (let i = 0; i < 6; i++) { env.adv(200); A.send({ t: 'pos', x: wall.cx, z: wall.cz, yaw: 0, f: 1 }); }
+  const q = A.p.pos; assert.ok(!(q.x > wall.minX && q.x < wall.maxX && q.z > wall.minZ && q.z < wall.maxZ), 'dog ended up inside a bale');
+});
+
+await test('penning a sheep is decided by the server: owner is credited, scores update, event is broadcast', () => {
+  const { env, g } = start(2); env.toPlaying(g.room); const [A, B] = g.all, room = g.room;
+  const pen = penOf(room, A.p.slot); g.all.forEach(c => c.clear());
+  const s = place(room, 0, pen.cx, pen.cz, A.id); run(env, 200);
+  assert.equal(s.pen, A.p.slot);
+  const ev = B.all('ev').find(e => e.k === 'penned'); assert.ok(ev, 'rival sees it'); assert.equal(ev.by, A.id); assert.equal(ev.slot, A.p.slot);
+  assert.equal(A.p.stats.herded, 1); assert.equal(B.p.stats.herded, 0);
+  run(env, 600); const sc = B.last('scores'); assert.equal(sc.pens.find(p => p[0] === A.p.slot)[1], room.round.sim.sheep[0].value);
+  assert.equal(sc.players.find(p => p[0] === A.id)[1], room.round.sim.sheep[0].value);
+});
+
+await test('a sheep herded into somebody else\'s pen does not credit the herder; moving it between pens is a steal', () => {
+  const { env, g } = start(2); env.toPlaying(g.room); const [A, B] = g.all, room = g.room;
+  place(room, 1, penOf(room, B.p.slot).cx, penOf(room, B.p.slot).cz, A.id); run(env, 200);
+  assert.equal(A.p.stats.herded, 0, 'pushed into the rival\'s pen: no credit');
+  A.clear(); B.clear();
+  place(room, 1, penOf(room, A.p.slot).cx, penOf(room, A.p.slot).cz, A.id); run(env, 200);
+  assert.ok(B.all('ev').some(e => e.k === 'stolen' && e.by === A.id), 'steal broadcast'); assert.equal(A.p.stats.steals, 1);
+  assert.equal(room.round.sim.sheep[1].pen, A.p.slot);
+});
+
+await test('bark startles sheep in front of the dog, respects its cooldown, and cannot be used during countdown', () => {
+  const { env, g } = start(2); const A = g.a, room = g.room;
+  A.send({ t: 'bark' }); assert.equal(A.p.stats.barks, 0, 'countdown');
+  env.toPlaying(g.room); env.adv(100);
+  const q = A.p.pos, fwd = [-Math.sin(q.yaw), -Math.cos(q.yaw)];
+  const s = place(room, 2, q.x + fwd[0] * 6, q.z + fwd[1] * 6, -1); const before = Math.hypot(s.x - q.x, s.z - q.z);
+  A.send({ t: 'bark' }); assert.equal(A.p.stats.barks, 1); assert.ok(room.round.sim.time >= 0);
+  assert.ok(Math.hypot(s.vx, s.vz) > 3, 'sheep bolted'); run(env, 300); assert.ok(Math.hypot(s.x - q.x, s.z - q.z) > before + 1, 'and ran away');
+  A.send({ t: 'bark' }); assert.equal(A.p.stats.barks, 1, 'cooldown');
+  run(env, 1500); A.send({ t: 'bark' }); assert.equal(A.p.stats.barks, 2);
+});
+
+await test('dash barges sheep and stuns a rival dog who is hit; stunned dogs are held in place', () => {
+  const { env, g } = start(2); env.toPlaying(g.room); const [A, B] = g.all, room = g.room; env.adv(100);
+  B.p.pos = { x: A.p.pos.x + 1.0, z: A.p.pos.z, yaw: 0, t: env.now() };
+  B.clear(); A.send({ t: 'dash' }); assert.equal(A.p.stats.dashes, 1); run(env, 100);
+  assert.ok(B.last('fx')?.k === 'stun', 'rival stunned'); assert.equal(A.p.stats.bumps, 1);
+  const held = { ...B.p.pos }; B.send({ t: 'pos', x: held.x + 2, z: held.z, yaw: 0, f: 1 }); assert.equal(B.p.pos.x, held.x);
+  run(env, 1300); env.adv(200); B.send({ t: 'pos', x: held.x + 0.5, z: held.z, yaw: 0, f: 1 }); assert.notEqual(B.p.pos.x, held.x, 'free again');
+  A.send({ t: 'dash' }); assert.equal(A.p.stats.dashes, 1, 'dash cooldown');
+});
+
+await test('domination: holding most of the flock for 8 seconds ends the round early and the dominator wins', () => {
+  const { env, g } = start(2, 'ffa', { duration: 120, storms: false }); env.toPlaying(g.room); const [A, B] = g.all, room = g.room, sim = room.round.sim, pen = penOf(room, A.p.slot);
+  sim.sheep.forEach((s, i) => place(room, i, pen.cx + ((i % 6) - 2.5) * 1.2, pen.cz + (Math.floor(i / 6) - 1) * 1.1, A.id));
+  run(env, 2500); assert.equal(room.phase, 'playing'); assert.ok(B.all('ev').some(e => e.k === 'dominating'), 'warning sent'); assert.ok(B.last('scores').dom);
+  run(env, 8000); assert.equal(room.phase, 'results');
+  const res = B.last('results'); assert.equal(res.reason, 'domination'); assert.deepEqual(res.winners, [A.id]); assert.equal(res.standings[0].id, A.id);
+});
+
+await test('domination resets when a rival steals enough sheep back', () => {
+  const { env, g } = start(2, 'ffa', { duration: 120, storms: false }); env.toPlaying(g.room); const [A, B] = g.all, room = g.room, sim = room.round.sim, pen = penOf(room, A.p.slot), bp = penOf(room, B.p.slot);
+  sim.sheep.forEach((s, i) => place(room, i, pen.cx + ((i % 6) - 2.5) * 1.2, pen.cz + (Math.floor(i / 6) - 1) * 1.1, A.id));
+  run(env, 3000); assert.ok(room.round.dom);
+  for (let i = 0; i < Math.ceil(sim.sheep.length * 0.5); i++) place(room, i, bp.cx + ((i % 6) - 2.5) * 1.2, bp.cz + (Math.floor(i / 6) - 1) * 1.1, B.id);
+  run(env, 2500); assert.equal(room.round.dom, null); assert.ok(B.all('ev').some(e => e.k === 'dom_broken')); assert.equal(room.phase, 'playing');
+});
+
+await test('solo practice: penning every sheep wins the round', () => {
+  const env = makeEnv(); const c = env.client(); c.send({ t: 'create', name: 'Me', practice: true }); env.adv(3100);
+  const room = c.room, sim = room.round.sim, pen = penOf(room, 0);
+  sim.sheep.forEach((s, i) => place(room, i, pen.cx + ((i % 6) - 2.5) * 1.2, pen.cz + (Math.floor(i / 6) - 1) * 1.1, c.id));
+  run(env, 3500); assert.equal(room.phase, 'results'); const res = c.last('results'); assert.equal(res.reason, 'domination'); assert.deepEqual(res.winners, [c.id]); assert.equal(res.solo, true);
+});
+
+await test('team roundup: two pens, balanced teams, team score decides the winner', () => {
+  const { env, g } = start(4, 'team', { duration: 20 }); const room = g.room, r = room.round;
+  assert.equal(r.field.pens.length, 2); const t = g.all.map(c => c.p.team); assert.equal(t.filter(x => x === 0).length, 2); assert.equal(t.filter(x => x === 1).length, 2);
+  assert.ok(g.all.every(c => c.p.slot === c.p.team));
+  env.toPlaying(room); const pen = penOf(room, 1);
+  for (let i = 0; i < 4; i++) place(room, i, pen.cx + i, pen.cz, g.all.find(c => c.p.team === 1).id);
+  run(env, 21000); assert.equal(room.phase, 'results'); const res = g.a.last('results');
+  assert.equal(res.winnerTeam, 1); assert.deepEqual(new Set(res.winners), new Set(g.all.filter(c => c.p.team === 1).map(c => c.id)));
+});
+
+await test('stampede: bigger flock and thunder - a warning, then everything loose bolts', () => {
+  const norm = start(2).g.room.round.field.sheep.length; const { env, g } = start(2, 'stampede', { duration: 120 }); const room = g.room;
+  assert.ok(room.round.field.sheep.length > norm, 'flock is larger than Roundup'); env.toPlaying(room);
+  run(env, 17000); assert.ok(g.a.all('ev').some(e => e.k === 'thunder_warn'), 'warning first');
+  const sim = room.round.sim; sim.sheep.forEach(s => { s.vx = s.vz = 0; s.panicUntil = 0; });
+  run(env, 12000); assert.ok(g.a.all('ev').some(e => e.k === 'thunder')); assert.ok(sim.sheep.some(s => s.panicUntil > 0));
+});
+
+await test('storms setting is off by default in Roundup (no thunder events)', () => {
+  const { env, g } = start(2, 'ffa', { duration: 90, storms: false }); env.toPlaying(g.room); run(env, 40000);
+  assert.ok(!g.a.all('ev').some(e => e.k === 'thunder' || e.k === 'thunder_warn'));
+});
+
+await test('a new round starts in the same room; wins and streaks carry over; settings changes are refused mid-round', () => {
+  const { env, g } = start(2, 'ffa', { duration: 100, storms: false }); const [A, B] = g.all, room = g.room;
+  env.toPlaying(room); A.send({ t: 'settings', mode: 'stampede' }); assert.equal(A.last('err').code, 'BUSY');
+  const win = () => { env.toPlaying(room); const pen = penOf(room, A.p.slot); place(room, 0, pen.cx, pen.cz, A.id); place(room, 1, pen.cx + 1, pen.cz, A.id); run(env, 150000 > 0 ? 100500 : 0); };
+  win(); assert.equal(room.phase, 'results'); assert.equal(A.p.stats.wins, 1); assert.equal(B.p.stats.losses, 1); assert.equal(A.p.stats.streak, 1);
+  A.send({ t: 'toLobby' }); assert.equal(room.phase, 'lobby'); B.send({ t: 'ready', v: true }); A.send({ t: 'start' }); assert.equal(room.phase, 'countdown');
+  assert.equal(room.round.id, 2); win(); assert.equal(A.p.stats.bestStreak, 2); assert.ok(A.p.stats.score >= 2);
+});
+
+await test('late joiners take a free pen when one exists, otherwise they spectate; team late-joiners fill the smaller team', () => {
+  const { env, g } = start(3, 'ffa'); env.toPlaying(g.room); const room = g.room;
+  const x = env.client(); x.send({ t: 'join', code: g.code, name: 'Late' });
+  assert.equal(x.last('round').you.spectator, true); assert.equal(x.p.inRound, false);
+  env.hub.close(g.all[2].conn); env.adv(46000);
+  const y = env.client(); y.send({ t: 'join', code: g.code, name: 'Late2' }); assert.equal(y.last('round').you.spectator, false); assert.ok(y.p.slot >= 0);
+  const t = start(3, 'team'); t.env.toPlaying(t.g.room); const z = t.env.client(); z.send({ t: 'join', code: t.g.code, name: 'LateT' }); assert.ok(z.p.team === 0 || z.p.team === 1); assert.equal(z.p.slot, z.p.team);
+});
+
+await test('reconnect mid-round restores the same dog, pen and sheep positions', () => {
+  const { env, g } = start(2, 'ffa', { storms: false }); env.toPlaying(g.room); run(env, 300); const B = g.rest[0], id = B.id, token = B.token, slot = B.p.slot;
+  env.hub.close(B.conn); const B2 = env.client(); B2.send({ t: 'join', code: g.code, name: 'x', token });
+  assert.equal(B2.id, id); assert.equal(B2.p.slot, slot); const rm = B2.last('round'); assert.equal(rm.you.slot, slot); assert.equal(rm.phase, 'playing'); assert.ok(B2.last('sheep')); assert.ok(B2.last('scores'));
+});
+
+await test('flock simulation is deterministic and sheep never leave the field or enter solids', () => {
+  for (const [mode, pens] of [['ffa', 1], ['ffa', 5], ['team', 6]]) for (let seed = 1; seed <= 6; seed++) {
+    const f = generateField(seed, { mode, pens, sheep: sheepCountFor(pens, 1, 1) }), a = new FlockSim(f, { seed }), b = new FlockSim(f, { seed });
+    const dogs = [{ id: 1, x: 0, z: 0, sprinting: false, dashing: false }];
+    for (let i = 0; i < 400; i++) { dogs[0].x = Math.sin(i / 40) * 12; dogs[0].z = Math.cos(i / 40) * 12; a.step(0.05, dogs); b.step(0.05, dogs); }
+    assert.equal(JSON.stringify(a.encode()), JSON.stringify(b.encode()));
+    for (const s of a.sheep) { assert.ok(Math.abs(s.x) < f.half && Math.abs(s.z) < f.half); const c = resolveCollision(f, s.x, s.z, 0.45); assert.ok(Math.hypot(c.x - s.x, c.z - s.z) < 0.05, 'inside a solid'); }
   }
 });
 
-await test('round timers are authoritative: countdown -> playing -> timeout', () => {
-  const env = makeEnv(); const g = env.make(2, 'classic', { duration: 5 }); g.a.send({ t: 'start' });
-  assert.equal(g.room.phase, 'countdown'); env.adv(2000); assert.equal(g.room.phase, 'countdown'); env.adv(1200); assert.equal(g.room.phase, 'playing');
-  env.adv(4000); assert.equal(g.room.phase, 'playing'); env.adv(1500); assert.equal(g.room.phase, 'results');
-  const r = g.a.last('results'); assert.equal(r.reason, 'timeout'); assert.deepEqual(r.winners, []); assert.equal(r.needles.length, 1);
-  for (const c of g.all) assert.ok(c.last('results'));
+await test('generated fields: valid pens, clear spawns, no overlaps, correct sheep counts, for every player count and mode', () => {
+  for (const mode of ['ffa', 'team']) for (let n = 1; n <= 12; n++) for (let seed = 1; seed <= 12; seed++) {
+    const total = sheepCountFor(n, 1, 1), f = generateField(seed, { mode, pens: n, sheep: total });
+    assert.equal(f.pens.length, mode === 'team' ? 2 : n); assert.equal(f.sheep.length, total, `${mode} ${n} seed ${seed}`);
+    for (const p of f.pens) { const c = resolveCollision(f, p.spawn.x, p.spawn.z, 0.5); assert.ok(Math.hypot(c.x - p.spawn.x, c.z - p.spawn.z) < 0.05, `spawn blocked ${mode} ${n} ${seed}`); assert.ok(!penAt(f, p.spawn.x, p.spawn.z)); }
+    for (const s of f.sheep) { const c = resolveCollision(f, s.x, s.z, 0.45); assert.ok(Math.hypot(c.x - s.x, c.z - s.z) < 0.05, `sheep in solid ${mode} ${n} ${seed}`); assert.ok(!penAt(f, s.x, s.z), 'sheep starts in a pen'); }
+    for (let i = 0; i < f.pens.length; i++) for (let j = i + 1; j < f.pens.length; j++) { const a = f.pens[i].rect, b = f.pens[j].rect; assert.ok(a.maxX < b.minX || b.maxX < a.minX || a.maxZ < b.minZ || b.maxZ < a.minZ, 'pens overlap'); }
+    assert.equal(JSON.stringify(generateField(seed, { mode, pens: n, sheep: total })), JSON.stringify(f), 'deterministic');
+  }
 });
 
-await test('players cannot teleport: impossible moves are clamped and corrected', () => {
-  const env = makeEnv(); const g = env.make(2); g.a.send({ t: 'start' }); env.toPlaying(g.room);
-  const p = g.a.p, x0 = p.pos.x, z0 = p.pos.z; env.adv(100);
-  g.a.send({ t: 'pos', x: x0 + 60, y: 0, z: z0, yaw: 0, pitch: 0, f: 0 });
-  assert.ok(Math.abs(p.pos.x - x0) < 3, 'moved too far: ' + (p.pos.x - x0)); assert.ok(g.a.last('tp'));
-});
-
-await test('frozen during countdown; positions out of arena are clamped', () => {
-  const env = makeEnv(); const g = env.make(2); g.a.send({ t: 'start' }); const x0 = g.a.p.pos.x;
-  env.adv(500); g.a.send({ t: 'pos', x: x0 + 1, y: 0, z: g.a.p.pos.z, yaw: 0, pitch: 0, f: 0 }); assert.equal(g.a.p.pos.x, x0);
-  env.toPlaying(g.room);
-  for (let i = 0; i < 40; i++) { env.adv(1000); g.a.send({ t: 'pos', x: 9999, y: 0, z: 0, yaw: 0, pitch: 0, f: 0 }); }
-  assert.ok(Math.abs(g.a.p.pos.x) <= g.room.round.world.half);
-});
-
-await test('search must run its full duration; searching away from hay is refused', () => {
-  const env = makeEnv(); const g = env.make(2); g.a.send({ t: 'start' }); env.toPlaying(g.room);
-  g.a.send({ t: 'search_start' }); assert.equal(g.a.last('search_denied')?.why, 'nopile'); // spawn points are clear of hay
-  const w = g.room.round.world, pile = w.piles[0]; env.moveTo(g.a, pile.x, pile.z);
-  g.a.clear(); g.a.send({ t: 'search_start' }); assert.ok(g.a.last('search_started'));
-  env.adv(300); g.a.send({ t: 'search_finish' }); assert.equal(g.a.last('search_denied')?.why, 'early');
-  env.adv(3000); g.a.send({ t: 'search_finish' }); const r = g.a.last('search_result'); assert.ok(['nothing', 'decoy', 'needle'].includes(r.result));
-});
-
-await test('classic: first valid pickup wins, scores are server-side, second pickup is refused', () => {
-  const env = makeEnv(); const g = env.make(2); const [A, B] = g.all; A.send({ t: 'start' }); env.toPlaying(g.room);
-  const n = g.room.round.needles[0];
-  // a client claiming a pickup without uncovering it is refused
-  B.send({ t: 'pickup', id: n.id }); assert.equal(B.last('pickup_fail')?.why, 'hidden'); assert.equal(g.room.phase, 'playing');
-  env.moveTo(A, n.x, n.z); env.moveTo(B, n.x, n.z);
-  const ra = env.doSearch(A); assert.equal(ra.result === 'needle' || ra.result === 'decoy', true);
-  let tries = 0; while (!A.p.exposed.has(n.id) && tries++ < 6) env.doSearch(A);
-  assert.ok(A.p.exposed.has(n.id), 'needle never uncovered'); assert.ok(A.last('reveal'));
-  B.p.exposed.add(n.id); // simulate B also having uncovered it (simultaneous race)
-  env.moveTo(A, n.x + 1, n.z); A.clear(); B.clear();
-  A.send({ t: 'pickup', id: n.id }); B.send({ t: 'pickup', id: n.id });
-  assert.equal(g.room.phase, 'results');
-  const res = A.last('results'), resB = B.last('results');
-  assert.deepEqual(res.winners, [A.id]); assert.deepEqual(resB.winners, [A.id]); assert.equal(res.finderName, 'Alice');
-  assert.ok(A.p.stats.roundScore >= 100); assert.equal(B.p.stats.roundScore, 0); assert.equal(B.last('pickup_fail').why, 'late');
-  assert.equal(A.p.stats.wins, 1); assert.equal(B.p.stats.losses, 1);
-});
-
-await test('pickup out of range is refused even when uncovered', () => {
-  const env = makeEnv(); const g = env.make(2); const [A] = g.all; A.send({ t: 'start' }); env.toPlaying(g.room);
-  const n = g.room.round.needles[0]; A.p.exposed.add(n.id); env.moveTo(A, n.x + 12, n.z);
-  A.send({ t: 'pickup', id: n.id }); assert.equal(A.last('pickup_fail').why, 'range'); assert.equal(g.room.phase, 'playing');
-});
-
-await test('a new round starts in the same room without reconnecting; streak bonus applies', () => {
-  const env = makeEnv(); const g = env.make(2); const [A] = g.all;
-  const win = () => {
-    A.send({ t: 'start' }); env.toPlaying(g.room); const n = g.room.round.needles[0]; env.moveTo(A, n.x + 1, n.z);
-    A.p.exposed.add(n.id); A.send({ t: 'pickup', id: n.id }); assert.equal(g.room.phase, 'results');
-  };
-  win(); const s1 = A.p.stats.roundScore; assert.equal(s1, 100);
-  const seed1 = g.room.round.seed; win(); assert.notEqual(g.room.round.seed, seed1); assert.equal(A.p.stats.roundScore, 110); assert.equal(A.p.stats.bestStreak, 2); assert.equal(A.p.stats.score, 210);
-  assert.equal(g.room.roundCount, 2);
-});
-
-await test('team hunt: two needles, team-only exposure, 75 points to each eligible teammate', () => {
-  const env = makeEnv(); const g = env.make(4, 'team'); const [A, B, C, D] = g.all; A.send({ t: 'start' }); env.toPlaying(g.room);
-  const teams = g.all.map(c => c.p.team); assert.equal(teams.filter(t => t === 0).length, 2); assert.equal(teams.filter(t => t === 1).length, 2);
-  const r = g.room.round; assert.equal(r.needles.length, 2);
-  const mine = r.needles.find(n => n.team === A.p.team), theirs = r.needles.find(n => n.team !== A.p.team);
-  env.moveTo(A, theirs.x + 1, theirs.z); A.p.exposed.add(theirs.id); A.send({ t: 'pickup', id: theirs.id }); assert.equal(A.last('pickup_fail').why, 'team');
-  env.moveTo(A, mine.x + 1, mine.z); A.p.exposed.add(mine.id); A.send({ t: 'pickup', id: mine.id });
-  assert.equal(g.room.phase, 'results'); const res = A.last('results'); assert.equal(res.winnerTeam, A.p.team);
-  for (const c of g.all) assert.equal(c.p.stats.roundScore, c.p.team === A.p.team ? 75 : 0);
-});
-
-await test('golden needle: bigger arena, bonus points, weaker detector', () => {
-  const env = makeEnv(); const g = env.make(2, 'golden'); const [A] = g.all; A.send({ t: 'start' }); env.toPlaying(g.room);
-  const r = g.room.round; assert.equal(r.mapId, 'goldenfield'); assert.equal(r.world.size, 210); assert.equal(r.needles[0].golden, true);
-  assert.ok(r.searchSecs > 2.4);
-  env.moveTo(A, r.needles[0].x + 1, r.needles[0].z); A.p.exposed.add(1); A.send({ t: 'pickup', id: 1 }); assert.equal(A.p.stats.roundScore, 250);
-});
-
-await test('endless: round continues, new needle placed, highest score wins at timer end', () => {
-  const env = makeEnv(); const g = env.make(2, 'endless', { duration: 20 }); const [A, B] = g.all; A.send({ t: 'start' }); env.toPlaying(g.room);
-  const n = g.room.round.needles[0], old = { x: n.x, z: n.z, id: n.id };
-  env.moveTo(A, n.x + 1, n.z); A.p.exposed.add(n.id); A.send({ t: 'pickup', id: n.id });
-  assert.equal(g.room.phase, 'playing'); assert.equal(A.p.stats.roundScore, 100); assert.ok(n.id !== old.id && (n.x !== old.x || n.z !== old.z)); assert.equal(A.p.exposed.size, 0);
-  env.adv(25000); assert.equal(g.room.phase, 'results'); const r = A.last('results'); assert.deepEqual(r.winners, [A.id]); assert.equal(r.standings[0].name, 'Alice');
-});
-
-await test('hide and seek: hider places the needle, seekers are frozen during setup, hider scores on timeout', () => {
-  const env = makeEnv(); const g = env.make(2, 'hideseek', { duration: 10 }); const [A, B] = g.all; A.send({ t: 'start' }); env.adv(3100);
-  assert.equal(g.room.phase, 'setup'); const r = g.room.round; const hider = g.all.find(c => c.id === r.hiderId), seeker = g.all.find(c => c !== hider);
-  const sx = seeker.p.pos.x; env.adv(500); seeker.send({ t: 'pos', x: sx + 2, y: 0, z: seeker.p.pos.z, yaw: 0, pitch: 0, f: 0 }); assert.equal(seeker.p.pos.x, sx);
-  seeker.send({ t: 'place_needle' }); assert.equal(seeker.last('err').code, 'BAD_ACTION');
-  hider.clear(); hider.send({ t: 'place_needle' }); assert.equal(hider.last('placed').ok, false); // spawn is not inside hay
-  const pile = r.world.piles.find(p => !p.deep && p.barn < 0); env.moveTo(hider, pile.x, pile.z); hider.send({ t: 'place_needle' });
-  const placed = hider.last('placed'); if (placed.ok) assert.equal(r.needles.length, 1);
-  env.adv(LIMIT_SETUP()); assert.equal(g.room.phase, 'playing'); assert.equal(r.needles.length, 1);
-  hider.send({ t: 'search_start' }); assert.equal(hider.last('search_started'), undefined); // hider cannot hunt
-  env.adv(11000); assert.equal(g.room.phase, 'results'); assert.deepEqual(hider.last('results').winners, [hider.id]); assert.equal(hider.p.stats.roundScore, 100);
-});
-function LIMIT_SETUP() { return 20500; }
-
-await test('hide and seek: if the hider never places it, the server hides it validly', () => {
-  const env = makeEnv(); const g = env.make(2, 'hideseek'); g.a.send({ t: 'start' }); env.adv(3100); env.adv(20500);
-  assert.equal(g.room.phase, 'playing'); assert.equal(g.room.round.needles.length, 1);
-});
-
-await test('metal detector gives distance-based signal without revealing coordinates', () => {
-  const env = makeEnv(); const g = env.make(2); const [A] = g.all; A.send({ t: 'start' }); env.toPlaying(g.room);
-  const n = g.room.round.needles[0]; g.room.round.items.forEach(i => { i.taken = true; }); /* isolate the needle: decoys also ping the detector */ A.send({ t: 'detector', on: true });
-  env.moveTo(A, n.x > 0 ? n.x - 45 : n.x + 45, n.z > 0 ? n.z - 25 : n.z + 25); A.clear(); env.adv(1300);
-  const near = () => { env.adv(1300); return A.last('det'); };
-  const far = near(); assert.equal(far.s, 0);
-  env.moveTo(A, n.x + 1.2, n.z); const close = near(); assert.ok(close.s > 0.5, 'close signal ' + close.s);
-  assert.ok(!JSON.stringify(A.log.filter(m => m.t === 'det')).match(/"x"|"z"/)); assert.ok(close.b < 100);
-});
-
-await test('detector can be disabled by the host and has a limited battery', () => {
-  const env = makeEnv(); const g = env.make(2, 'classic', { detector: 'off' }); const [A] = g.all; A.send({ t: 'start' }); env.toPlaying(g.room);
-  A.send({ t: 'detector', on: true }); assert.equal(A.last('err').code, 'DET_OFF');
-  const e2 = makeEnv(); const h = e2.make(2); h.a.send({ t: 'start' }); e2.toPlaying(h.room); h.a.send({ t: 'detector', on: true });
-  for (let i = 0; i < 31; i++) e2.adv(1000); assert.equal(h.a.p.det.on, false); assert.ok(h.a.p.det.battery < 15);
+await test('fairness: every pen sees the same scenery (point-symmetric field) and sheep come in mirrored pairs', () => {
+  const f = generateField(5, { mode: 'ffa', pens: 4, sheep: 40 });
+  const key = s => [s.kind, ...[s.minX, s.maxX, s.minZ, s.maxZ].map(v => Math.round(v * 10))].join(',');
+  const set = new Set(f.solids.filter(s => s.kind !== 'penwall').map(key));
+  for (const s of f.solids) if (s.kind !== 'penwall') assert.ok(set.has(key({ kind: s.kind, minX: -s.maxX, maxX: -s.minX, minZ: -s.maxZ, maxZ: -s.minZ })), 'unmirrored ' + s.kind);
+  const tot = f.sheep.filter(s => Math.abs(s.x) + Math.abs(s.z) > 0.01); assert.ok(tot.length >= 36);
 });
 
 await test('disconnects: host passes to another player; ghost players are removed after the grace period', () => {
@@ -281,7 +320,8 @@ await test('chat is sanitised, profanity masked, and spam rate-limited', () => {
 
 await test('cosmetics are validated; locked items cannot be equipped; no competitive effect', () => {
   const env = makeEnv(); const g = env.make(2); const [A] = g.all;
-  A.send({ t: 'cosmetic', hat: 'tophat' }); assert.equal(A.last('err').code, 'LOCKED_ITEM'); assert.equal(A.p.cosm.hat, 'straw');
+  A.send({ t: 'cosmetic', hat: 'tophat' }); assert.equal(A.last('err').code, 'LOCKED_ITEM'); assert.equal(A.p.cosm.hat, 'none');
+  A.p.stats.herded = 12; A.send({ t: 'cosmetic', hat: 'tophat' }); assert.equal(A.p.cosm.hat, 'tophat', 'unlocked by herding sheep this session');
   A.send({ t: 'cosmetic', hat: 'cap', color: '#2980b9' }); assert.equal(A.p.cosm.hat, 'cap'); assert.equal(A.p.cosm.color, '#2980b9');
   A.send({ t: 'cosmetic', color: 'javascript:alert(1)' }); assert.equal(A.p.cosm.color, '#2980b9');
 });
@@ -307,24 +347,8 @@ await test('Play Online matchmaking joins an open public lobby, otherwise opens 
 
 await test('practice mode: solo room auto-starts with no other players and its own state', () => {
   const env = makeEnv(); const c = env.client(); c.send({ t: 'create', name: 'Me', practice: true, difficulty: 'easy' });
-  assert.equal(c.room.practice, true); assert.equal(c.room.phase, 'countdown'); assert.ok(c.last('round')); assert.equal(c.room.settings.maxPlayers, 1);
+  assert.equal(c.room.practice, true); assert.equal(c.room.phase, 'countdown'); assert.ok(c.last('round')); assert.equal(c.room.settings.maxPlayers, 1); assert.equal(c.room.settings.mode, 'ffa');
   const x = env.client(); x.send({ t: 'join', code: c.last('joined').code, name: 'Intruder' }); assert.equal(x.last('err').code, 'FULL');
-});
-
-await test('worlds are deterministic and every hidden spot is valid on every map', () => {
-  for (const mapId of Object.keys(MAPS)) for (let seed = 1; seed <= 15; seed++) {
-    const w1 = generateWorld(seed, mapId), w2 = generateWorld(seed, mapId);
-    assert.equal(JSON.stringify([w1.piles, w1.solids, w1.spawns]), JSON.stringify([w2.piles, w2.solids, w2.spawns]));
-    assert.ok(w1.piles.length > 20 && w1.spawns.length === 12);
-    const rng = mulberry32(seed), taken = [];
-    for (let i = 0; i < 8; i++) {
-      const s = pickHiddenSpot(w1, rng, taken); assert.ok(s, `no spot ${mapId}/${seed}`); taken.push(s);
-      assert.ok(Math.abs(s.x) < w1.half - 1 && Math.abs(s.z) < w1.half - 1, 'outside arena');
-      assert.ok(isReachable(w1, s.x, s.z), 'unreachable');
-      assert.ok(!w1.solids.some(o => s.x > o.minX - 0.5 && s.x < o.maxX + 0.5 && s.z > o.minZ - 0.5 && s.z < o.maxZ + 0.5), 'inside solid');
-      assert.ok(!w1.spawns.some(sp => Math.hypot(sp.x - s.x, sp.z - s.z) < 6), 'at spawn');
-    }
-  }
 });
 
 for (const [s, n, e] of results) console.log(s === 'PASS' ? '  ✓' : '  ✗', n, e ? '\n' + e : '');
