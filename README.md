@@ -1,7 +1,7 @@
 # NIGHT SHIFT: The Last Bell
 
 First-person horror-comedy in the browser. Solo, 2–12 player co-op, or Monster-vs-Survivors, set on a fictional campus
-(**Midnight Regional College**). Survive until sunrise, find the five Incidents, and ring out the Last Bell.
+. Survive until sunrise, find the five Incidents, and ring out the Last Bell.
 All characters and events are fictional.
 
 ## Run
